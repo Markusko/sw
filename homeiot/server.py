@@ -1,0 +1,383 @@
+"""HTTP layer: a small JSON API, static files, and a server-sent event feed.
+
+Standard library only -- `python3 -m homeiot` is the whole install procedure.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import queue
+import re
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Callable
+from urllib.parse import parse_qs, unquote, urlparse
+
+from . import demo, hue, hub as hub_module, model, net, store
+
+WEB_ROOT = Path(__file__).resolve().parent / "web"
+CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".json": "application/json",
+    ".webmanifest": "application/manifest+json",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+}
+
+Handler = Callable[[dict[str, Any], re.Match, dict[str, Any], dict[str, Any]], Any]
+
+
+class ApiError(Exception):
+    def __init__(self, message: str, status: int = 400) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+# --- handlers ----------------------------------------------------------------
+
+
+def get_state(hub: dict[str, Any], _match, _body, _query) -> Any:
+    return hub_module.snapshot(hub)
+
+
+def post_refresh(hub: dict[str, Any], _match, _body, _query) -> Any:
+    hub_module.refresh_all(hub)
+    return {"ok": True, "revision": hub["revision"]}
+
+
+def post_discover(hub: dict[str, Any], _match, body, _query) -> Any:
+    return {"bridges": hub_module.discover(hub, deep=bool(body.get("deep")))}
+
+
+def post_pair(hub: dict[str, Any], _match, body, _query) -> Any:
+    from . import discovery
+
+    ip = str(body.get("ip", "")).strip()
+    if not ip:
+        raise ApiError("an address is required")
+    found = discovery.probe_bridge(ip)
+    if not found:
+        raise ApiError(f"no Hue bridge answered at {ip}", 404)
+    try:
+        credentials = hue.pair(ip)
+    except hue.LinkButtonError as error:
+        raise ApiError(str(error) or "press the link button, then try again", 428) from error
+    except hue.BridgeError as error:
+        raise ApiError(str(error), 502) from error
+    bridge = hue.make_bridge(found, credentials)
+    hub_module.add_bridge(hub, bridge)
+    return {"ok": True, "bridge": {key: bridge[key] for key in ("id", "name", "ip", "api", "model")}}
+
+
+def post_demo(hub: dict[str, Any], _match, _body, _query) -> Any:
+    hub_module.add_bridge(hub, dict(demo.BRIDGE))
+    return {"ok": True}
+
+
+def delete_bridge(hub: dict[str, Any], match, _body, _query) -> Any:
+    hub_module.remove_bridge(hub, match.group("id"))
+    return {"ok": True}
+
+
+def put_target_state(hub: dict[str, Any], match, body, _query) -> Any:
+    try:
+        return hub_module.command(hub, match.group("id"), body)
+    except LookupError as error:
+        raise ApiError(str(error), 404) from error
+
+
+def post_scene(hub: dict[str, Any], match, body, _query) -> Any:
+    try:
+        return hub_module.recall_scene(hub, match.group("id"), body)
+    except LookupError as error:
+        raise ApiError(str(error), 404) from error
+    except hue.BridgeError as error:
+        raise ApiError(str(error), 502) from error
+
+
+def post_identify(hub: dict[str, Any], match, _body, _query) -> Any:
+    try:
+        return hub_module.identify(hub, match.group("id"))
+    except LookupError as error:
+        raise ApiError(str(error), 404) from error
+    except hue.BridgeError as error:
+        raise ApiError(str(error), 502) from error
+
+
+def put_name(hub: dict[str, Any], match, body, _query) -> Any:
+    try:
+        return hub_module.rename(hub, match.group("id"), str(body.get("name", "")))
+    except LookupError as error:
+        raise ApiError(str(error), 404) from error
+    except hue.BridgeError as error:
+        raise ApiError(str(error), 502) from error
+
+
+def post_collection(hub: dict[str, Any], _match, body, _query) -> Any:
+    collection = store.normalise_collection(body)
+    hub_module.mutate_config(hub, lambda config: store.put_collection(config, collection))
+    return {"ok": True, "collection": collection}
+
+
+def put_collection(hub: dict[str, Any], match, body, _query) -> Any:
+    collection_id = match.group("id")
+    existing = next((c for c in hub["config"]["collections"] if c["id"] == collection_id), None)
+    if not existing:
+        raise ApiError("no such collection", 404)
+    updated = store.normalise_collection(body, existing)
+    hub_module.mutate_config(hub, lambda config: store.put_collection(config, updated))
+    return {"ok": True, "collection": updated}
+
+
+def delete_collection(hub: dict[str, Any], match, _body, _query) -> Any:
+    hub_module.mutate_config(hub, lambda config: store.drop_collection(config, match.group("id")))
+    return {"ok": True}
+
+
+def put_ui(hub: dict[str, Any], _match, body, _query) -> Any:
+    allowed = {key: body[key] for key in ("theme", "view", "compact", "accent") if key in body}
+    hub_module.mutate_config(hub, lambda config: {**config, "ui": {**config.get("ui", {}), **allowed}})
+    return {"ok": True, "ui": hub["config"]["ui"]}
+
+
+def post_scan(hub: dict[str, Any], _match, _body, _query) -> Any:
+    return hub_module.scan_network(hub)
+
+
+ROUTES: list[tuple[str, re.Pattern, Handler]] = [
+    ("GET", re.compile(r"^/api/state$"), get_state),
+    ("POST", re.compile(r"^/api/refresh$"), post_refresh),
+    ("POST", re.compile(r"^/api/discover$"), post_discover),
+    ("POST", re.compile(r"^/api/pair$"), post_pair),
+    ("POST", re.compile(r"^/api/demo$"), post_demo),
+    ("DELETE", re.compile(r"^/api/bridges/(?P<id>[^/]+)$"), delete_bridge),
+    ("PUT", re.compile(r"^/api/targets/(?P<id>[^/]+)/state$"), put_target_state),
+    ("PUT", re.compile(r"^/api/targets/(?P<id>[^/]+)/name$"), put_name),
+    ("POST", re.compile(r"^/api/scenes/(?P<id>[^/]+)/recall$"), post_scene),
+    ("POST", re.compile(r"^/api/devices/(?P<id>[^/]+)/identify$"), post_identify),
+    ("POST", re.compile(r"^/api/collections$"), post_collection),
+    ("PUT", re.compile(r"^/api/collections/(?P<id>[^/]+)$"), put_collection),
+    ("DELETE", re.compile(r"^/api/collections/(?P<id>[^/]+)$"), delete_collection),
+    ("PUT", re.compile(r"^/api/ui$"), put_ui),
+    ("POST", re.compile(r"^/api/scan$"), post_scan),
+]
+
+
+# --- request handling --------------------------------------------------------
+
+
+def make_handler(hub: dict[str, Any], token: str | None):
+    class DashboardHandler(BaseHTTPRequestHandler):
+        server_version = "homeiot"
+        protocol_version = "HTTP/1.1"
+
+        # -- plumbing
+        def log_message(self, fmt: str, *args: Any) -> None:
+            if hub.get("verbose"):
+                sys.stderr.write(f"{self.address_string()} {fmt % args}\n")
+
+        def _send(self, status: int, body: bytes, content_type: str, extra: dict[str, str] | None = None) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            for key, value in (extra or {}).items():
+                self.send_header(key, value)
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _json(self, status: int, payload: Any) -> None:
+            body = json.dumps(payload, default=str).encode()
+            self._send(status, body, "application/json; charset=utf-8", {"Cache-Control": "no-store"})
+
+        def _read_body(self) -> dict[str, Any]:
+            length = int(self.headers.get("Content-Length") or 0)
+            if not length:
+                return {}
+            try:
+                parsed = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                raise ApiError("malformed JSON body") from error
+            return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+        def _authorised(self, query: dict[str, Any]) -> bool:
+            if not token:
+                return True
+            supplied = (
+                self.headers.get("X-Auth-Token")
+                or (query.get("token") or [None])[0]
+                or _cookie(self.headers.get("Cookie", ""), "homeiot_token")
+            )
+            return supplied == token
+
+        def _same_origin(self) -> bool:
+            """Block cross-site writes; a browser always sends Origin on those."""
+            origin = self.headers.get("Origin")
+            if not origin or self.command in ("GET", "HEAD"):
+                return True
+            return urlparse(origin).netloc == self.headers.get("Host")
+
+        # -- verbs
+        def do_GET(self) -> None:
+            self._dispatch()
+
+        def do_HEAD(self) -> None:
+            self._dispatch()
+
+        def do_POST(self) -> None:
+            self._dispatch()
+
+        def do_PUT(self) -> None:
+            self._dispatch()
+
+        def do_DELETE(self) -> None:
+            self._dispatch()
+
+        def _dispatch(self) -> None:
+            parsed = urlparse(self.path)
+            # ids carry colons, which the browser percent-encodes on the way in
+            path = unquote(parsed.path).rstrip("/") or "/"
+            query = parse_qs(parsed.query)
+            try:
+                if not self._authorised(query):
+                    return self._json(401, {"error": "a token is required"})
+                if not self._same_origin():
+                    return self._json(403, {"error": "cross-origin writes are refused"})
+                if path == "/api/events":
+                    return self._stream()
+                candidates = [(method, pattern.match(path), handler) for method, pattern, handler in ROUTES]
+                candidates = [(method, match, handler) for method, match, handler in candidates if match]
+                for method, match, handler in candidates:
+                    if method == self.command:
+                        body = self._read_body() if self.command in ("POST", "PUT") else {}
+                        return self._json(200, handler(hub, match, body, query))
+                if candidates:
+                    allowed = ", ".join(sorted({method for method, _match, _handler in candidates}))
+                    return self._json(405, {"error": f"{self.command} not allowed here; try {allowed}"})
+                if path.startswith("/api/"):
+                    return self._json(404, {"error": "no such endpoint"})
+                return self._static(path)
+            except ApiError as error:
+                self._json(error.status, {"error": str(error)})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as error:  # never take the server down for one request
+                self._json(500, {"error": f"{type(error).__name__}: {error}"})
+
+        def _static(self, path: str) -> None:
+            relative = "index.html" if path == "/" else path.lstrip("/")
+            target = (WEB_ROOT / relative).resolve()
+            if not str(target).startswith(str(WEB_ROOT)) or not target.is_file():
+                target = WEB_ROOT / "index.html"
+            body = target.read_bytes()
+            content_type = CONTENT_TYPES.get(target.suffix, "application/octet-stream")
+            cache = "no-cache" if target.suffix in (".html", ".js", ".css") else "max-age=86400"
+            self._send(200, body, content_type, {"Cache-Control": cache})
+
+        def _stream(self) -> None:
+            channel = hub_module.subscribe(hub)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            try:
+                self._emit("state", hub_module.snapshot(hub))
+                while not hub["stopping"].is_set():
+                    try:
+                        payload = channel.get(timeout=15)
+                    except queue.Empty:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                        continue
+                    self._emit("state", payload)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                hub_module.unsubscribe(hub, channel)
+
+        def _emit(self, event: str, payload: Any) -> None:
+            data = json.dumps(payload, default=str)
+            self.wfile.write(f"event: {event}\ndata: {data}\n\n".encode())
+            self.wfile.flush()
+
+    return DashboardHandler
+
+
+def _cookie(header: str, name: str) -> str | None:
+    for part in header.split(";"):
+        key, _, value = part.strip().partition("=")
+        if key == name:
+            return value
+    return None
+
+
+# --- entry point -------------------------------------------------------------
+
+
+def build_hub(demo_mode: bool = False) -> dict[str, Any]:
+    config = store.load()
+    hub = hub_module.create(config)
+    if demo_mode and not any(bridge.get("demo") for bridge in config.get("bridges", [])):
+        hub["config"] = store.put_bridge(config, dict(demo.BRIDGE))
+    return hub
+
+
+def serve(host: str = "0.0.0.0", port: int = 8712, demo_mode: bool = False,
+          token: str | None = None, verbose: bool = False) -> None:
+    hub = build_hub(demo_mode)
+    hub["verbose"] = verbose
+    hub_module.start(hub)
+
+    server = ThreadingHTTPServer((host, port), make_handler(hub, token))
+    server.daemon_threads = True
+    address = net.local_ip() if host in ("0.0.0.0", "") else host
+    print(f"homeiot -> http://{address}:{port}  (local: http://127.0.0.1:{port})")
+    if demo_mode:
+        print("demo bridge active -- simulated devices, no hardware needed")
+    if token:
+        print(f"access token required: append ?token={token} on first visit")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopping")
+    finally:
+        hub_module.stop(hub)
+        server.shutdown()
+        server.server_close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="homeiot", description="Home IoT dashboard")
+    parser.add_argument("--host", default="0.0.0.0", help="interface to bind (default: all)")
+    parser.add_argument("--port", type=int, default=8712)
+    parser.add_argument("--demo", action="store_true", help="add a simulated bridge")
+    parser.add_argument("--token", default=None, help="require this token in ?token= or X-Auth-Token")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--discover", action="store_true", help="print discovered bridges and exit")
+    parser.add_argument("--scan", action="store_true", help="print every IoT host found on the LAN and exit")
+    arguments = parser.parse_args(argv)
+
+    if arguments.discover:
+        from . import discovery
+
+        for bridge in discovery.discover_hue(deep=True):
+            print(f"{bridge['ip']:<16} {bridge['name']}  ({bridge['model']}, API {bridge['api_version']})")
+        return 0
+    if arguments.scan:
+        from . import discovery
+
+        for host in discovery.scan_network():
+            labels = ", ".join(host.get("labels", [])) or "unknown"
+            print(f"{host['ip']:<16} {host.get('hostname', ''):<28} {labels}")
+        return 0
+
+    serve(arguments.host, arguments.port, arguments.demo, arguments.token, arguments.verbose)
+    return 0
