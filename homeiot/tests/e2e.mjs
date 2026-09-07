@@ -133,5 +133,37 @@ for (let i = 0; i < 3; i += 1) {
 }
 check('theme cycles through all three modes', new Set(modes).size === 3, modes.join(' -> '));
 
+// 9. live updates must patch the page, never rebuild it under the cursor:
+//    a wholesale swap restarts hover and glow transitions and reads as a twitch
+await page.locator('[data-view="devices"]').click();
+await page.waitForTimeout(400);
+const steady = await page.evaluate(async () => {
+  const card = [...document.querySelectorAll('.card')].find((c) => c.textContent.includes('Hallway bulb'));
+  let replaced = 0;
+  const observer = new MutationObserver((records) => {
+    replaced += records.reduce((count, record) => count + record.addedNodes.length, 0);
+  });
+  observer.observe(document.getElementById('main'), { childList: true });
+  card.querySelector('.toggle').click();
+  await new Promise((done) => setTimeout(done, 5000)); // long enough to cover a poll
+  observer.disconnect();
+  return { replaced, alive: card.isConnected };
+});
+check('live updates patch the page instead of rebuilding it', steady.replaced === 0 && steady.alive,
+  `nodes replaced=${steady.replaced}, card kept=${steady.alive}`);
+
+// 10. an open editor belongs to the user, not to the incoming state
+await page.locator('[data-view="collections"]').click();
+await page.waitForTimeout(300);
+await page.locator('[data-act="new-collection"]').first().click();
+await page.waitForTimeout(300);
+await page.fill('#collection-name', 'Half typed');
+await page.locator('.picker label:has-text("Wardrobe light") input').check();
+await page.waitForTimeout(5000);
+check('the open editor keeps what you typed',
+  (await page.inputValue('#collection-name')) === 'Half typed' &&
+    (await page.locator('.picker label:has-text("Wardrobe light") input').isChecked()));
+await page.locator('.drawer [data-act="close"]').first().click();
+
 console.log(errors.length ? 'CONSOLE ERRORS:\n' + errors.join('\n') : 'no console errors');
 await browser.close();

@@ -2,7 +2,8 @@
  *
  * The shape of the thing: a snapshot arrives over server-sent events, pure
  * functions turn it into HTML, and one delegated listener turns clicks back
- * into API calls.  Re-rendering is frozen while a slider is being dragged.
+ * into API calls.  Updates are applied to the existing DOM, never by
+ * replacing it, so nothing moves under the cursor.
  */
 
 const App = {
@@ -11,9 +12,6 @@ const App = {
   query: '',
   theme: localStorage.getItem('theme') || 'auto',
   drawer: null, // {kind: 'detail'|'edit', id}
-  dragging: false,
-  pointerActive: false,
-  pending: false,
   connection: 'connecting',
   discovered: null,
 };
@@ -640,11 +638,15 @@ function drawerEditor(snapshot, collection) {
 function renderDrawer() {
   const overlay = $('#overlay');
   if (!App.drawer) {
-    overlay.innerHTML = '';
+    if (overlay.firstChild) overlay.replaceChildren();
+    overlay.dataset.editor = '';
     return;
   }
   const snapshot = App.snapshot;
   const { kind, id } = App.drawer;
+  // The collection editor is a form, not a view of live data: once it is on
+  // screen it belongs to the user until they save or cancel.
+  if (kind === 'edit' && overlay.dataset.editor === String(id)) return;
   let body = '';
   if (kind === 'edit') body = drawerEditor(snapshot, id ? byId(snapshot.collections, id) : null);
   else {
@@ -656,39 +658,96 @@ function renderDrawer() {
     else if (collection) body = drawerCollection(collection, snapshot);
     else {
       App.drawer = null;
-      overlay.innerHTML = '';
+      overlay.replaceChildren();
       return;
     }
   }
-  overlay.innerHTML = `<div class="scrim" data-act="close"></div><aside class="drawer" role="dialog" aria-modal="true">${body}</aside>`;
+  paint(overlay, `<div class="scrim" data-act="close"></div><aside class="drawer" role="dialog" aria-modal="true">${body}</aside>`);
+  overlay.dataset.editor = kind === 'edit' ? String(id) : '';
 }
 
 // --- render ------------------------------------------------------------------
 
-// A repaint driven by incoming state must wait while the user is mid-gesture:
-// replacing the DOM between mousedown and mouseup would swallow their click,
-// and replacing a slider under the finger would drop the drag.
-const sliderInUse = () =>
-  App.dragging || (document.activeElement && document.activeElement.matches('input[type="range"]'));
-const busy = () => App.pointerActive || sliderInUse();
+// --- painting ----------------------------------------------------------------
+// The UI is rendered as HTML strings, but applied to the page in place.  A
+// wholesale innerHTML swap on every state update tears down whatever the
+// cursor is resting on, so hover and glow transitions restart from zero and
+// the card twitches under your hand -- and a home on a polling bridge gets a
+// fresh set of nodes every few seconds whether anything changed or not.
 
-function render(force) {
-  if (!force && busy()) {
-    App.pending = true;
+const painted = new WeakMap();
+
+function write(element, html) {
+  if (painted.get(element) !== html) {
+    element.innerHTML = html;
+    painted.set(element, html);
+  }
+}
+
+function paint(root, html) {
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  morphChildren(root, template.content);
+}
+
+function morph(before, after) {
+  if (before.nodeType !== after.nodeType || before.nodeName !== after.nodeName) {
+    before.replaceWith(after);
     return;
   }
+  if (before.nodeType !== Node.ELEMENT_NODE) {
+    if (before.nodeValue !== after.nodeValue) before.nodeValue = after.nodeValue;
+    return;
+  }
+  syncAttributes(before, after);
+  morphChildren(before, after);
+}
+
+// Matching child counts means the structure held and only values moved; any
+// other shape (a device appeared, the view switched, a search narrowed the
+// grid) is a real rebuild -- of that one level, not the whole page.
+function morphChildren(before, after) {
+  const existing = [...before.childNodes];
+  const wanted = [...after.childNodes];
+  if (existing.length !== wanted.length) {
+    before.replaceChildren(...wanted);
+    return;
+  }
+  wanted.forEach((node, index) => morph(existing[index], node));
+}
+
+function syncAttributes(before, after) {
+  for (const { name, value } of [...after.attributes]) {
+    if (before.getAttribute(name) !== value) before.setAttribute(name, value);
+  }
+  for (const { name } of [...before.attributes]) {
+    if (!after.hasAttribute(name)) before.removeAttribute(name);
+  }
+  // Never write over a control the user is holding: a slider mid-drag keeps
+  // the value under the finger, not the one the bridge last echoed back.
+  if (before.tagName === 'INPUT' && document.activeElement !== before) {
+    const value = after.getAttribute('value');
+    if (value !== null && before.value !== value) before.value = value;
+    if (before.type === 'checkbox') before.checked = after.hasAttribute('checked');
+  }
+}
+
+function render() {
   const snapshot = App.snapshot;
   applyTheme();
-  $('#tabs').innerHTML = VIEWS.map(
-    ([key, label]) =>
-      `<button role="tab" data-act="view" data-view="${key}" aria-selected="${App.view === key}">${label}</button>`
-  ).join('');
-  $('#refresh').innerHTML = icons.refresh;
-  $('#theme').innerHTML = { auto: icons.auto, light: icons.sun, dark: icons.moon }[App.theme];
+  write(
+    $('#tabs'),
+    VIEWS.map(
+      ([key, label]) =>
+        `<button role="tab" data-act="view" data-view="${key}" aria-selected="${App.view === key}">${label}</button>`
+    ).join('')
+  );
+  write($('#refresh'), icons.refresh);
+  write($('#theme'), { auto: icons.auto, light: icons.sun, dark: icons.moon }[App.theme]);
   $('#theme').title = { auto: 'Theme: follows the system', light: 'Theme: light', dark: 'Theme: dark' }[App.theme];
 
   if (!snapshot) {
-    $('#main').innerHTML = emptyState('Connecting…', 'Reading the state of your home.');
+    paint($('#main'), emptyState('Connecting…', 'Reading the state of your home.'));
     return;
   }
   updateLinkState(snapshot);
@@ -697,7 +756,7 @@ function render(force) {
   $('#tabs').hidden = onboarding;
   $('#search').closest('.search').hidden = onboarding;
   if (onboarding) {
-    $('#main').innerHTML = viewSetup();
+    paint($('#main'), viewSetup());
     renderDrawer();
     return;
   }
@@ -709,7 +768,7 @@ function render(force) {
     scenes: () => viewScenes(snapshot, query),
     network: () => viewNetwork(snapshot),
   };
-  $('#main').innerHTML = (views[App.view] || views.rooms)();
+  paint($('#main'), (views[App.view] || views.rooms)());
   renderDrawer();
 }
 
@@ -726,7 +785,7 @@ function updateLinkState(snapshot) {
     ? 'live'
     : 'polling';
   const state = App.connection !== 'open' ? 'warn' : broken.length ? 'down' : live ? 'live' : 'warn';
-  $('#linkstate').innerHTML = `<i class="dot ${state}"></i>${esc(label)}`;
+  write($('#linkstate'), `<i class="dot ${state}"></i>${esc(label)}`);
   $('#linkstate').title = broken.map((bridge) => `${bridge.name}: ${bridge.error || 'offline'}`).join('\n');
 }
 
@@ -754,7 +813,7 @@ function optimistic(id, changes) {
         : collection
     ),
   };
-  render(true);
+  render();
 }
 
 const findAny = (id) =>
@@ -769,15 +828,15 @@ const actions = {
   view: (element) => {
     App.view = element.dataset.view;
     localStorage.setItem('view', App.view);
-    render(true);
+    render();
   },
   open: (element) => {
     App.drawer = { kind: 'detail', id: element.dataset.id };
-    render(true);
+    render();
   },
   close: () => {
     App.drawer = null;
-    render(true);
+    render();
   },
   toggle: (element) => {
     const id = element.dataset.id;
@@ -808,11 +867,11 @@ const actions = {
   },
   'new-collection': () => {
     App.drawer = { kind: 'edit', id: null };
-    render(true);
+    render();
   },
   'edit-collection': (element) => {
     App.drawer = { kind: 'edit', id: element.dataset.id };
-    render(true);
+    render();
   },
   'save-collection': (element) => {
     const name = $('#collection-name').value.trim() || 'Untitled';
@@ -845,7 +904,7 @@ const actions = {
       .then((result) => {
         App.discovered = result.bridges;
         App.discovering = false;
-        render(true);
+        render();
         if (!result.bridges.length) toast('No bridge found on this network', true);
       })
       .catch((error) => {
@@ -861,7 +920,7 @@ const actions = {
   'add-bridge': () => {
     App.view = 'rooms';
     App.snapshot = { ...App.snapshot, bridges: [] };
-    render(true);
+    render();
   },
   'add-demo': () => api('POST', '/api/demo', {}).then(refresh).then(() => toast('Demo bridge added')).catch(fail),
   'forget-bridge': (element) => {
@@ -914,37 +973,9 @@ document.addEventListener('input', (event) => {
   }
 });
 
-// A slider under the finger (or holding focus) must not be re-rendered away.
-// Repainting is also deferred while any pointer is down: replacing the DOM
-// between mousedown and mouseup would swallow the click that follows.
-document.addEventListener('pointerdown', (event) => {
-  App.pointerActive = true;
-  if (event.target.matches('input[type="range"]')) App.dragging = true;
-});
-
-const thaw = () => {
-  App.dragging = false;
-  if (App.pending && !busy()) {
-    App.pending = false;
-    render(true);
-  }
-};
-const thawSoon = () => setTimeout(() => App.pointerActive || thaw(), 0);
-// (pointerup clears pointerActive first, so the deferred thaw runs after the click)
-
-const pointerDone = () => {
-  App.pointerActive = false;
-  thawSoon();
-};
-document.addEventListener('pointerup', pointerDone);
-document.addEventListener('pointercancel', pointerDone);
-document.addEventListener('focusout', (event) => {
-  if (event.target.matches && event.target.matches('input[type="range"]')) thawSoon();
-});
-
 $('#search').addEventListener('input', (event) => {
   App.query = event.target.value;
-  render(true);
+  render();
 });
 
 $('#theme').addEventListener('click', () => {
@@ -952,7 +983,7 @@ $('#theme').addEventListener('click', () => {
   App.theme = App.theme === 'auto' ? (showingDark ? 'light' : 'dark') : App.theme === 'dark' ? 'light' : 'auto';
   localStorage.setItem('theme', App.theme);
   api('PUT', '/api/ui', { theme: App.theme }).catch(() => {});
-  render(true);
+  render();
 });
 
 $('#refresh').addEventListener('click', (event) => {
@@ -978,7 +1009,7 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => App.
 function refresh() {
   return api('GET', '/api/state').then((snapshot) => {
     App.snapshot = snapshot;
-    render(true);
+    render();
   });
 }
 
@@ -993,7 +1024,7 @@ function connect() {
     if (App.theme === 'auto' && App.snapshot.ui && App.snapshot.ui.theme && !localStorage.getItem('theme')) {
       App.theme = App.snapshot.ui.theme;
     }
-    render(); // state-driven: yields to a slider in use
+    render();
   });
   source.addEventListener('error', () => {
     App.connection = 'lost';
@@ -1007,6 +1038,6 @@ function tickClock() {
 
 tickClock();
 setInterval(tickClock, 20000);
-render(true);
+render();
 refresh().catch(() => {});
 connect();
