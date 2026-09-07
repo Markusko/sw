@@ -5,13 +5,18 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import socket
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
-from homeiot import color, demo, discovery, hue, model, store
+from homeiot import color, demo, discovery, hue, hub as hub_module, model, server, store
 
 
 class ColorTests(unittest.TestCase):
@@ -271,6 +276,52 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_txt_records(self):
         self.assertEqual(discovery._parse_txt(b"\x07key=val"), {"key": "val"})
+
+
+class ServerTests(unittest.TestCase):
+    """A client that vanishes is routine, not a crash to report."""
+
+    ABORT = b"\x01\x00\x00\x00\x00\x00\x00\x00"  # SO_LINGER: reset, do not close politely
+
+    def setUp(self):
+        hub = hub_module.create(store.load(Path("/nonexistent")))
+        self.httpd = server.DashboardServer(("127.0.0.1", 0), server.make_handler(hub, None))
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=2)
+
+    def _abort(self, request: bytes | None, read: bool) -> None:
+        client = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+        if request:
+            client.sendall(request)
+        if read:
+            client.recv(64)
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, self.ABORT)
+        client.close()
+
+    def test_dropped_connections_stay_quiet(self):
+        noise = io.StringIO()
+        with contextlib.redirect_stderr(noise):
+            for _ in range(3):
+                self._abort(b"GET /api/state HTTP/1.1\r\nHost: x\r\n\r\n", read=True)
+                self._abort(b"GET /api/events HTTP/1.1\r\nHost: x\r\n\r\n", read=True)
+                self._abort(b"GET /api/st", read=False)  # half a request, then gone
+                self._abort(None, read=False)  # connected and said nothing
+            time.sleep(0.4)
+        self.assertNotIn("Traceback", noise.getvalue())
+        self.assertEqual(noise.getvalue(), "")
+
+    def test_the_server_still_answers_afterwards(self):
+        self._abort(b"GET /api/state HTTP/1.1\r\nHost: x\r\n\r\n", read=True)
+        client = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+        client.sendall(b"GET /api/state HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        self.assertIn(b"200 OK", client.recv(256))
+        client.close()
 
 
 if __name__ == "__main__":

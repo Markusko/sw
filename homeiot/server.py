@@ -33,6 +33,19 @@ CONTENT_TYPES = {
 
 Handler = Callable[[dict[str, Any], re.Match, dict[str, Any], dict[str, Any]], Any]
 
+# A browser closing a keep-alive connection or an event stream raises these,
+# and on Windows it happens constantly (WinError 10053).  It is not an error:
+# nothing failed, the other end simply went away.
+DISCONNECTS = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, TimeoutError)
+
+
+class DashboardServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        if not isinstance(sys.exc_info()[1], DISCONNECTS):
+            super().handle_error(request, client_address)
+
 
 class ApiError(Exception):
     def __init__(self, message: str, status: int = 400) -> None:
@@ -179,6 +192,14 @@ def make_handler(hub: dict[str, Any], token: str | None):
         protocol_version = "HTTP/1.1"
 
         # -- plumbing
+        def handle_one_request(self) -> None:
+            # Raised while waiting for the next request on a kept-alive socket,
+            # which is outside any handler's reach.
+            try:
+                super().handle_one_request()
+            except DISCONNECTS:
+                self.close_connection = True
+
         def log_message(self, fmt: str, *args: Any) -> None:
             if hub.get("verbose"):
                 sys.stderr.write(f"{self.address_string()} {fmt % args}\n")
@@ -266,7 +287,7 @@ def make_handler(hub: dict[str, Any], token: str | None):
                 return self._static(path)
             except ApiError as error:
                 self._json(error.status, {"error": str(error)})
-            except (BrokenPipeError, ConnectionResetError):
+            except DISCONNECTS:
                 pass
             except Exception as error:  # never take the server down for one request
                 self._json(500, {"error": f"{type(error).__name__}: {error}"})
@@ -298,7 +319,7 @@ def make_handler(hub: dict[str, Any], token: str | None):
                         self.wfile.flush()
                         continue
                     self._emit("state", payload)
-            except (BrokenPipeError, ConnectionResetError, OSError):
+            except (OSError, *DISCONNECTS):
                 pass
             finally:
                 hub_module.unsubscribe(hub, channel)
@@ -336,8 +357,7 @@ def serve(host: str = "0.0.0.0", port: int = 8712, demo_mode: bool = False,
     hub["verbose"] = verbose
     hub_module.start(hub)
 
-    server = ThreadingHTTPServer((host, port), make_handler(hub, token))
-    server.daemon_threads = True
+    server = DashboardServer((host, port), make_handler(hub, token))
     address = net.local_ip() if host in ("0.0.0.0", "") else host
     print(f"homeiot -> http://{address}:{port}  (local: http://127.0.0.1:{port})")
     if demo_mode:
