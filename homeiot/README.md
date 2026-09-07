@@ -32,6 +32,57 @@ If discovery finds nothing (some networks block multicast), type the bridge's
 address into the field below the button. `python3 -m homeiot --discover` runs
 the same search from the command line, including a sweep of your /24.
 
+## Windows, from PowerShell
+
+Install Python 3.11 or newer (`winget install Python.Python.3.12`, or python.org —
+tick *Add python.exe to PATH*), then, from the folder that **contains** `homeiot`
+(the repository root, not the `homeiot` folder itself — it runs as a module):
+
+```powershell
+py -3 -m homeiot --demo     # try it with simulated devices
+py -3 -m homeiot            # the real thing
+```
+
+It prints the address to open, e.g. `http://192.168.1.20:8712`. Stop it with
+Ctrl+C.
+
+**Let other devices reach it.** Windows blocks the inbound port by default. Say
+*Allow* if Defender prompts on first run; otherwise, in an **Administrator**
+PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName "homeiot" -Direction Inbound `
+  -Protocol TCP -LocalPort 8712 -Action Allow -Profile Private
+```
+
+Keep it to `-Profile Private` so it is never exposed on a public network.
+
+**Run it without a console window**, and start it at logon:
+
+```powershell
+$root = "C:\path\to\sw"
+$action  = New-ScheduledTaskAction -Execute "pythonw.exe" -Argument "-m homeiot" -WorkingDirectory $root
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+Register-ScheduledTask -TaskName homeiot -Action $action -Trigger $trigger -Description "Home IoT dashboard"
+```
+
+Start or stop it on demand with `Start-ScheduledTask homeiot` /
+`Stop-ScheduledTask homeiot`. To kill whatever is holding the port:
+
+```powershell
+Get-NetTCPConnection -LocalPort 8712 -State Listen |
+  Select-Object -ExpandProperty OwningProcess | Stop-Process
+```
+
+**If discovery finds nothing**, it is usually a Windows machine with several
+adapters — a VPN, Hyper-V or WSL virtual switch — sending the multicast query
+out of the wrong one. Two ways round it: `py -3 -m homeiot --discover`, which
+also sweeps your /24 directly, or the *enter an address* box on the setup
+screen. Pairing works the same either way.
+
+Everything else in this README applies unchanged; only `run.sh` is
+POSIX-only, and on Windows you simply call the module instead.
+
 ## What it does
 
 **Lights** — on/off, brightness, colour (presets and a hue slider, clamped to

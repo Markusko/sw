@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -227,7 +228,8 @@ class StoreTests(unittest.TestCase):
             config = store.load(path)
             config = store.put_bridge(config, {"id": "abc", "ip": "10.0.0.2"})
             store.save(config, path)
-            self.assertEqual(oct(path.stat().st_mode)[-3:], "600")
+            if os.name == "posix":  # Windows has no mode bits to check
+                self.assertEqual(oct(path.stat().st_mode)[-3:], "600")
             self.assertEqual(store.load(path)["bridges"][0]["id"], "abc")
 
     def test_collections_are_sanitised(self):
