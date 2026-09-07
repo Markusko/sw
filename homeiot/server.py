@@ -155,7 +155,7 @@ def delete_collection(hub: dict[str, Any], match, _body, _query) -> Any:
 
 
 def put_ui(hub: dict[str, Any], _match, body, _query) -> Any:
-    allowed = {key: body[key] for key in ("theme", "view", "compact", "accent") if key in body}
+    allowed = {key: body[key] for key in ("theme",) if key in body}
     hub_module.mutate_config(hub, lambda config: {**config, "ui": {**config.get("ui", {}), **allowed}})
     return {"ok": True, "ui": hub["config"]["ui"]}
 

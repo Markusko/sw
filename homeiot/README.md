@@ -6,14 +6,19 @@ lets you control the ones that can be controlled — lamps, plugs, rooms, zones,
 scenes, and your own cross-cutting **Collections**.
 
 It runs on your machine, talks only to your LAN, and stores everything under
-`homeiot/data/`. No cloud account, no broker, no dependencies.
+`homeiot/data/`. No cloud account, no broker, nothing to install.
+
+Built for a tablet on the wall or the kitchen counter: every control is a
+native HTML input, sized for a thumb.
 
 ```
 python3 -m homeiot            # then open the printed http://<your-ip>:8712
 python3 -m homeiot --demo     # simulated devices, no hardware needed
 ```
 
-Python 3.11+, standard library only.
+Python 3.11+, standard library only. The browser side uses Bootstrap and
+morphdom, both vendored in `web/vendor/` -- the tablet must keep working when
+the internet does not, so nothing is fetched from a CDN at runtime.
 
 ---
 
@@ -85,10 +90,10 @@ POSIX-only, and on Windows you simply call the module instead.
 
 ## What it does
 
-**Lights** — on/off, brightness, colour (presets and a hue slider, clamped to
-each lamp's actual gamut), colour temperature in kelvin, effects (candle, fire,
-sparkle, prism …), blink, identify, rename. Devices with several lamps inside
-them get per-lamp controls too.
+**Lights** — on/off, brightness, colour (presets, or the device's own colour
+picker; either way clamped to the lamp's actual gamut), colour temperature in
+kelvin, effects (candle, fire, sparkle, prism …), identify, rename. Devices
+with several lamps inside them get per-lamp switches too.
 
 **Plugs** — on/off.
 
@@ -99,10 +104,10 @@ the secure range, battery level, and how long ago each reading changed.
 button event and battery.
 
 **Rooms and zones** — the groups you already made in the Hue app, each with one
-toggle, one brightness slider, and its scenes as chips. A room writes to the
+switch, one brightness slider, and its scenes as buttons. A room writes to the
 bridge's `grouped_light` service, so the whole room changes in one round trip.
 
-**Scenes** — recall any scene, with its colours shown on the chip.
+**Scenes** — recall any scene from the card of the room it belongs to.
 
 **Collections** — your own groupings, which is the part Hue does not do: any
 mix of devices, rooms and zones under one name, controlled together. "Evening",
@@ -117,10 +122,10 @@ mix of devices, rooms and zones under one name, controlled together. "Evening",
 > collection". Renaming it later is a one-word change in `app.js` and the
 > `collections` key in `config.json`.
 
-**Network** — everything else answering mDNS or SSDP on your LAN: HomeKit
-accessories, Matter devices, Shelly and Tasmota nodes, ESPHome, Cast targets,
-printers. They are listed, not controlled; Hue is the integration that exists
-today.
+**Settings** — pair and remove bridges, and scan the LAN for everything else
+answering mDNS or SSDP: HomeKit accessories, Matter devices, Shelly and Tasmota
+nodes, ESPHome, Cast targets, printers. They are listed, not controlled; Hue is
+the integration that exists today.
 
 ## Live updates
 
@@ -129,6 +134,28 @@ it: press a physical dimmer switch and the card moves at once. The browser gets
 its own event stream from this server, so several phones stay in sync with each
 other. Older bridges are polled every four seconds instead. The header pill
 says which mode you are in.
+
+## The interface
+
+Every control is the browser's own, styled by Bootstrap:
+
+| Control | What it actually is |
+| --- | --- |
+| On/off | `<input type="checkbox" role="switch">` |
+| Dimmer, warmth | `<input type="range">` |
+| Colour | preset buttons and `<input type="color">` |
+| Effect | `<select>` |
+| Detail panel | Bootstrap offcanvas |
+
+That is the whole design rule, and it is what makes it reliable on a tablet:
+touch handling, momentum, focus rings, keyboard support, the OS colour picker
+and every accessibility affordance come from the platform rather than from
+code of mine that has to be right on every device. Switches, dimmers and tabs
+are at least 44px on their short side, and the end-to-end suite measures them
+on every run rather than trusting the CSS.
+
+Live updates are applied to the page with morphdom, so nothing is torn down
+under a finger mid-gesture.
 
 ## Layout
 
@@ -144,6 +171,7 @@ homeiot/
 ├── store.py         config.json, atomically, 0600
 ├── demo.py          a simulated bridge with a full range of devices
 ├── web/             index.html, app.css, app.js — no build step
+│   └── vendor/      bootstrap.min.css, bootstrap.bundle.min.js, morphdom
 ├── data/            config.json lives here (gitignored)
 └── tests/           unit tests, plus a Playwright end-to-end script
 ```
@@ -210,16 +238,19 @@ else in the app skips verification.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s homeiot/tests -t .     # 35 unit tests, no network
+python3 -m unittest discover -s homeiot/tests -t .     # 37 unit tests, no network
 
 python3 -m homeiot --demo &                            # end-to-end, needs Playwright
 node homeiot/tests/e2e.mjs
 ```
 
-The end-to-end script drives a real browser through the demo bridge and asserts
-that each interaction actually changed the state on the server — toggles,
-sliders, colour, colour temperature, effects, scenes, collections, search and
-theme.
+The end-to-end script drives a real browser with a **touchscreen and a tablet
+viewport**, taps rather than clicks, and asserts that each interaction actually
+changed the state on the server: switches, dimmers, colour, colour temperature,
+effects, scenes, collections and theme. It also measures every touch target,
+checks that live updates patch the page instead of rebuilding it, and checks
+that nothing scrolls sideways at phone, tablet-portrait and tablet-landscape
+widths.
 
 ## Adding another integration
 

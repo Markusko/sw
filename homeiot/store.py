@@ -21,7 +21,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "version": 1,
     "bridges": [],
     "collections": [],
-    "ui": {"theme": "auto", "view": "rooms", "compact": False},
+    "ui": {"theme": "auto"},
 }
 
 _LOCK = threading.Lock()

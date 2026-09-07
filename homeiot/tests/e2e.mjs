@@ -1,10 +1,12 @@
-/* End-to-end check against a running demo bridge.
+/* End-to-end check against a running demo bridge, driven as a tablet.
  *
  *   python3 -m homeiot --demo &
  *   node homeiot/tests/e2e.mjs
  *
- * Needs Playwright.  If it is installed somewhere this script cannot resolve,
- * point PLAYWRIGHT_MODULE at it, and HOMEIOT_URL at a server on another port.
+ * The context has a touchscreen and a tablet viewport, and every interaction
+ * below is a tap rather than a click, because that is how this thing is used.
+ * Needs Playwright; point PLAYWRIGHT_MODULE at it if the import cannot resolve,
+ * and HOMEIOT_URL at a server on another port.
  */
 
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
@@ -13,157 +15,203 @@ const base = process.env.HOMEIOT_URL || 'http://127.0.0.1:8712';
 const state = async () => (await fetch(`${base}/api/state`)).json();
 const find = (list, name) => list.find((item) => item.name === name);
 const errors = [];
-const check = (label, ok, detail = '') => console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${detail ? '  — ' + detail : ''}`);
+let failures = 0;
+const check = (label, ok, detail = '') => {
+  if (!ok) failures += 1;
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${detail ? '  — ' + detail : ''}`);
+};
 
 const browser = await chromium.launch();
-const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-page.on('pageerror', (e) => errors.push(e.message));
-page.on('dialog', (d) => d.accept('Renamed lamp'));
-page.on('console', (m) => m.type() === 'error' && errors.push(m.text()));
+const context = await browser.newContext({
+  viewport: { width: 820, height: 1180 }, // iPad-ish, portrait
+  hasTouch: true,
+  isMobile: false,
+  deviceScaleFactor: 2,
+});
+const page = await context.newPage();
+page.on('pageerror', (error) => errors.push(error.message));
+page.on('dialog', (dialog) => dialog.accept('Renamed lamp'));
+page.on('console', (message) => message.type() === 'error' && errors.push(message.text()));
+page.on('requestfailed', (request) => errors.push(`request failed: ${request.url()}`));
 await page.goto(base, { waitUntil: 'domcontentloaded' });
-await page.waitForTimeout(900);
-
-// 1. room toggle reaches the bridge
-const room = page.locator('.card:has-text("Living room")').first();
-await room.locator('.toggle').click();
 await page.waitForTimeout(1200);
-let s = await state();
-check('room toggle off reaches the server', find(s.groups, 'Living room').state.on_count === 0,
-  `on_count=${find(s.groups, 'Living room').state.on_count}`);
 
-// 2. scene recall
-await page.locator('[data-view="scenes"]').click();
-await page.waitForTimeout(400);
-await page.locator('.chip:has-text("Movie night")').first().click();
+const card = (name) => page.locator('.card').filter({ hasText: name }).first();
+const openPanel = async (name) => {
+  await card(name).getByRole('button', { name: new RegExp(name) }).tap();
+  await page.waitForSelector('#panel.show', { state: 'visible' });
+  await page.waitForTimeout(400);
+};
+const closePanel = async () => {
+  await page.locator('#panel .btn-close').tap();
+  await page.waitForSelector('#panel.show', { state: 'detached' }).catch(() => {});
+  await page.waitForTimeout(400);
+};
+
+// 1. everything the finger has to hit is big enough to hit
+const sizes = await page.evaluate(() => {
+  const measure = (selector) =>
+    [...document.querySelectorAll(selector)].map((element) => {
+      const box = element.getBoundingClientRect();
+      return Math.min(box.width, box.height);
+    });
+  return {
+    switches: measure('input[role=switch]'),
+    ranges: measure('input[type=range]'),
+    tabs: measure('#tabs .nav-link'),
+    buttons: measure('.btn:not(.btn-link)'),
+  };
+});
+const smallest = (values) => Math.min(...values);
+check('switches are a comfortable touch target', smallest(sizes.switches) >= 28,
+  `smallest side ${smallest(sizes.switches).toFixed(0)}px`);
+check('dimmers are a comfortable touch target', smallest(sizes.ranges) >= 40,
+  `smallest side ${smallest(sizes.ranges).toFixed(0)}px`);
+check('tabs are a comfortable touch target', smallest(sizes.tabs) >= 40,
+  `smallest side ${smallest(sizes.tabs).toFixed(0)}px`);
+check('buttons are a comfortable touch target', smallest(sizes.buttons) >= 36,
+  `smallest side ${smallest(sizes.buttons).toFixed(0)}px`);
+
+// 2. tapping a room switch reaches the bridge
+await card('Living room').locator('input[role=switch]').tap();
 await page.waitForTimeout(1300);
-s = await state();
-check('scene recall marks the scene active', find(s.scenes, 'Movie night').active === true);
-check('scene recall switched lamps on', find(s.groups, 'Living room').state.on_count > 0,
-  `on_count=${find(s.groups, 'Living room').state.on_count}`);
+let snapshot = await state();
+check('tapping a room switch reaches the server', find(snapshot.groups, 'Living room').state.on_count === 0,
+  `on_count=${find(snapshot.groups, 'Living room').state.on_count}`);
 
-// 3. drawer: brightness + colour on one lamp
-await page.locator('[data-view="devices"]').click();
-await page.waitForTimeout(400);
-await page.click('.card:has-text("Sofa left") .card-open', { position: { x: 120, y: 18 } });
+// 3. a scene button on the room card
+await card('Living room').getByRole('button', { name: 'Movie night' }).tap();
+await page.waitForTimeout(1300);
+snapshot = await state();
+check('tapping a scene recalls it', find(snapshot.scenes, 'Movie night').active === true);
+check('the scene switched lamps on', find(snapshot.groups, 'Living room').state.on_count > 0,
+  `on_count=${find(snapshot.groups, 'Living room').state.on_count}`);
+
+// 4. the detail panel opens by tap, and its dimmer drives the lamp
+await page.locator('#tabs .nav-link', { hasText: 'Devices' }).tap();
 await page.waitForTimeout(500);
-const slider = page.locator('.drawer input[data-act="brightness"]').first();
-await slider.fill('22');
-await slider.dispatchEvent('input');
+await openPanel('Sofa left');
+const dimmer = page.locator('#panel input[data-act="brightness"]');
+await dimmer.fill('22');
+await dimmer.dispatchEvent('change');
 await page.waitForTimeout(1200);
-s = await state();
-check('drawer brightness reaches the server', find(s.devices, 'Sofa left').state.brightness === 22,
-  `brightness=${find(s.devices, 'Sofa left').state.brightness}`);
+snapshot = await state();
+check('the panel dimmer reaches the server', find(snapshot.devices, 'Sofa left').state.brightness === 22,
+  `brightness=${find(snapshot.devices, 'Sofa left').state.brightness}`);
 
-await page.locator('.drawer .swatches button').nth(9).click(); // a blue preset
+// 5. tapping the track of a native range moves it -- the browser's own handling
+const track = await dimmer.boundingBox();
+await page.touchscreen.tap(track.x + track.width * 0.75, track.y + track.height / 2);
+await page.waitForTimeout(1300);
+snapshot = await state();
+const dragged = find(snapshot.devices, 'Sofa left').state.brightness;
+check('tapping along the dimmer track changes brightness', dragged > 40, `brightness=${dragged}`);
+
+// 6. colour, by preset and by the native colour input
+await page.locator('#panel [data-act="colour"]').nth(8).tap();
+await page.waitForTimeout(1300);
+snapshot = await state();
+const hex = find(snapshot.devices, 'Sofa left').state.hex;
+check('tapping a colour preset reaches the server', /^#[0-9a-f]{6}$/.test(hex) && hex !== '#ffffff', `hex=${hex}`);
+check('the panel offers a native colour input', await page.locator('#panel input[type=color]').count() === 1);
+
+// 7. colour temperature and effects
+await closePanel();
+await openPanel('Bedside left');
+const warmth = page.locator('#panel input[data-act="mirek"]');
+await warmth.fill('454');
+await warmth.dispatchEvent('change');
 await page.waitForTimeout(1200);
-s = await state();
-const hex = find(s.devices, 'Sofa left').state.hex;
-check('colour preset reaches the server', /^#[0-9a-f]{6}$/.test(hex) && hex !== '#ffffff', `hex=${hex}`);
+snapshot = await state();
+check('colour temperature reaches the server', find(snapshot.devices, 'Bedside left').state.mirek === 454,
+  `mirek=${find(snapshot.devices, 'Bedside left').state.mirek}`);
 
-// 4. colour temperature
-await page.locator('.drawer [data-act="close"]').first().click();
-await page.waitForTimeout(300);
-await page.locator('[data-view="devices"]').click();
-await page.waitForTimeout(300);
-await page.click('.card:has-text("Bedside left") .card-open', { position: { x: 120, y: 18 } });
+await closePanel();
+await openPanel('Counter strip');
+await page.locator('#panel select[data-act="effect"]').selectOption('candle');
+await page.waitForTimeout(1200);
+snapshot = await state();
+check('choosing an effect reaches the server', find(snapshot.devices, 'Counter strip').state.effect === 'candle',
+  `effect=${find(snapshot.devices, 'Counter strip').state.effect}`);
+await closePanel();
+
+// 8. collections, created and driven entirely by touch
+await page.locator('#tabs .nav-link', { hasText: 'Collections' }).tap();
 await page.waitForTimeout(500);
-const ct = page.locator('.drawer input[data-act="mirek"]').first();
-await ct.fill('454');
-await ct.dispatchEvent('input');
-await page.waitForTimeout(1200);
-s = await state();
-check('colour temperature reaches the server', find(s.devices, 'Bedside left').state.mirek === 454,
-  `mirek=${find(s.devices, 'Bedside left').state.mirek}`);
-
-// 5. an effect
-await page.locator('.drawer [data-act="close"]').first().click();
-await page.waitForTimeout(300);
-await page.click('.card:has-text("Counter strip") .card-open', { position: { x: 120, y: 18 } });
-await page.waitForTimeout(500);
-await page.locator('.drawer .chip:has-text("candle")').click();
-await page.waitForTimeout(1200);
-s = await state();
-check('effect reaches the server', find(s.devices, 'Counter strip').state.effect === 'candle',
-  `effect=${find(s.devices, 'Counter strip').state.effect}`);
-await page.locator('.drawer [data-act="close"]').first().click();
-
-// 6. collection round trip through the UI
-await page.waitForTimeout(300);
-await page.locator('[data-view="collections"]').click();
-await page.waitForTimeout(400);
-await page.locator('[data-act="new-collection"]').first().click();
-await page.waitForTimeout(400);
+await page.locator('[data-act="new-collection"]').first().tap();
+await page.waitForSelector('#collection-name');
 await page.fill('#collection-name', 'Evening');
-await page.locator('.picker label:has-text("Bedside left") input').check();
-await page.locator('.picker label:has-text("Hallway bulb") input').check();
-await page.locator('[data-act="save-collection"]').click();
+await page.locator('.picker .form-check', { hasText: 'Bedside left' }).locator('input').tap();
+await page.locator('.picker .form-check', { hasText: 'Hallway bulb' }).locator('input').tap();
+await page.locator('[data-act="save-collection"]').tap();
+await page.waitForTimeout(1200);
+snapshot = await state();
+const collection = find(snapshot.collections, 'Evening');
+check('a collection can be built by touch', !!collection && collection.member_ids.length === 2);
+
+await card('Evening').locator('input[role=switch]').tap();
+await page.waitForTimeout(1400);
+snapshot = await state();
+check('a collection switch drives every member',
+  find(snapshot.devices, 'Bedside left').state.on === find(snapshot.devices, 'Hallway bulb').state.on,
+  `${find(snapshot.devices, 'Bedside left').state.on} / ${find(snapshot.devices, 'Hallway bulb').state.on}`);
+
+await openPanel('Evening');
+await page.locator('[data-act="delete-collection"]').tap();
 await page.waitForTimeout(1000);
-s = await state();
-const collection = find(s.collections, 'Evening');
-check('collection created with 2 members', !!collection && collection.member_ids.length === 2);
+snapshot = await state();
+check('a collection can be deleted', !find(snapshot.collections, 'Evening'));
 
-await page.locator('.card:has-text("Evening") .toggle').click();
-await page.waitForTimeout(1300);
-s = await state();
-check('collection toggle drives every member',
-  find(s.devices, 'Bedside left').state.on === find(s.devices, 'Hallway bulb').state.on,
-  `${find(s.devices, 'Bedside left').state.on} / ${find(s.devices, 'Hallway bulb').state.on}`);
-
-await page.click('.card:has-text("Evening") .card-open', { position: { x: 120, y: 18 } });
-await page.waitForTimeout(400);
-await page.locator('[data-act="delete-collection"]').click();
-await page.waitForTimeout(800);
-s = await state();
-check('collection deleted', !find(s.collections, 'Evening'));
-
-// 7. search + live updates keep working
-await page.locator('[data-view="devices"]').click();
-await page.fill('#search', 'bedside');
-await page.waitForTimeout(400);
-check('search filters the grid', (await page.locator('.card').count()) === 2,
-  `cards=${await page.locator('.card').count()}`);
-await page.fill('#search', '');
-
-// 8. theme toggle
-const modes = [await page.getAttribute('html', 'data-theme-mode')];
-for (let i = 0; i < 3; i += 1) {
-  await page.click('#theme');
-  await page.waitForTimeout(250);
-  modes.push(await page.getAttribute('html', 'data-theme-mode'));
-}
-check('theme cycles through all three modes', new Set(modes).size === 3, modes.join(' -> '));
-
-// 9. live updates must patch the page, never rebuild it under the cursor:
-//    a wholesale swap restarts hover and glow transitions and reads as a twitch
-await page.locator('[data-view="devices"]').click();
-await page.waitForTimeout(400);
+// 9. live updates patch the page rather than rebuilding it under the finger
+await page.locator('#tabs .nav-link', { hasText: 'Devices' }).tap();
+await page.waitForTimeout(500);
 const steady = await page.evaluate(async () => {
-  const card = [...document.querySelectorAll('.card')].find((c) => c.textContent.includes('Hallway bulb'));
+  const target = [...document.querySelectorAll('.card')].find((c) => c.textContent.includes('Hallway bulb'));
   let replaced = 0;
   const observer = new MutationObserver((records) => {
     replaced += records.reduce((count, record) => count + record.addedNodes.length, 0);
   });
   observer.observe(document.getElementById('main'), { childList: true });
-  card.querySelector('.toggle').click();
+  target.querySelector('input[role=switch]').click();
   await new Promise((done) => setTimeout(done, 5000)); // long enough to cover a poll
   observer.disconnect();
-  return { replaced, alive: card.isConnected };
+  return { replaced, alive: target.isConnected };
 });
 check('live updates patch the page instead of rebuilding it', steady.replaced === 0 && steady.alive,
   `nodes replaced=${steady.replaced}, card kept=${steady.alive}`);
 
 // 10. an open editor belongs to the user, not to the incoming state
-await page.locator('[data-view="collections"]').click();
-await page.waitForTimeout(300);
-await page.locator('[data-act="new-collection"]').first().click();
-await page.waitForTimeout(300);
+await page.locator('#tabs .nav-link', { hasText: 'Collections' }).tap();
+await page.waitForTimeout(400);
+await page.locator('[data-act="new-collection"]').first().tap();
+await page.waitForSelector('#collection-name');
 await page.fill('#collection-name', 'Half typed');
-await page.locator('.picker label:has-text("Wardrobe light") input').check();
+await page.locator('.picker .form-check', { hasText: 'Wardrobe light' }).locator('input').tap();
 await page.waitForTimeout(5000);
 check('the open editor keeps what you typed',
   (await page.inputValue('#collection-name')) === 'Half typed' &&
-    (await page.locator('.picker label:has-text("Wardrobe light") input').isChecked()));
-await page.locator('.drawer [data-act="close"]').first().click();
+    (await page.locator('.picker .form-check', { hasText: 'Wardrobe light' }).locator('input').isChecked()));
+await closePanel();
+
+// 11. theme
+const modes = [await page.getAttribute('html', 'data-theme-mode')];
+for (let index = 0; index < 3; index += 1) {
+  await page.locator('#theme').tap();
+  await page.waitForTimeout(300);
+  modes.push(await page.getAttribute('html', 'data-theme-mode'));
+}
+check('theme cycles through all three modes', new Set(modes).size === 3, modes.join(' -> '));
+check('dark mode reaches Bootstrap', ['light', 'dark'].includes(await page.getAttribute('html', 'data-bs-theme')));
+
+// 12. nothing spills sideways, on a tablet or a phone
+for (const [label, width, height] of [['phone', 390, 844], ['tablet portrait', 820, 1180], ['tablet landscape', 1180, 820]]) {
+  await page.setViewportSize({ width, height });
+  await page.waitForTimeout(500);
+  const spill = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  check(`no sideways scrolling on ${label}`, spill <= 0, `overflow=${spill}px`);
+}
 
 console.log(errors.length ? 'CONSOLE ERRORS:\n' + errors.join('\n') : 'no console errors');
+console.log(failures ? `${failures} FAILED` : 'all checks passed');
 await browser.close();
+process.exit(failures || errors.length ? 1 : 0);
