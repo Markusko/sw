@@ -532,13 +532,144 @@ class SwisscomTests(unittest.TestCase):
         values = {reading["label"]: reading["display"] for reading in built["readings"]}
         self.assertEqual(values["Reachable"], "Yes")
         self.assertEqual(values["Local API"], "No password set")
-        self.assertIn("--probe-box", built["note"])
+        self.assertIn("password", built["note"])
 
     def test_a_rejected_password_is_not_dressed_up_as_success(self):
         device = {"id": "b", "ip": "192.168.1.1", "password": "wrong", "name": "Internet-Box"}
         built = swisscom.home(device, {"reachable": True, "detail": {"error": "no"}})["devices"][0]
         values = {reading["label"]: reading["display"] for reading in built["readings"]}
         self.assertEqual(values["Local API"], "Password not accepted")
+
+    def test_uptime_is_shown_the_way_a_person_reads_it(self):
+        self.assertEqual(swisscom._uptime(93825), "1d 2h 3m")  # a day, plus change
+        self.assertEqual(swisscom._uptime(65), "1m")  # under an hour: no "0h" clutter
+        self.assertEqual(swisscom._uptime(None), "")
+        self.assertEqual(swisscom._uptime("not a number"), "")
+
+
+# --- a fake Internet-Box speaking the dialect a real one answered ------------
+# Modelled on what a live Internet-Box 4 actually said when asked: POST
+# /sysbus/<Service>:<method> over the SAH content type, answered with no
+# "result" envelope; DeviceInfo and NMC public; everything else refused
+# (error 13, "Permission denied") until BOTH the contextID from a POST /ws
+# login AND the session cookie that same reply sets are sent back -- a real
+# login attempt that supplied only the first looked identical to a wrong
+# password until tested live, which is why the fake here enforces both. The
+# device list itself is not /sysbus/Devices:get (the box never answers that
+# to anyone) but a /ws RPC call, exactly as the real webui sends it.
+
+SYSBUS_PASSWORD = "letmein123"
+SYSBUS_CONTEXT = "ctx-abc123"
+SYSBUS_COOKIE = "deviceid/sessid=cookie-xyz"
+
+
+class SysbusHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        sent = json.loads(self.rfile.read(length) or b"{}")
+        sah = self.headers.get("Content-Type") == "application/x-sah-ws-4-call+json"
+        authed = (sah and self.headers.get("X-Context") == SYSBUS_CONTEXT
+                  and self.headers.get("Authorization") == f"X-Sah {SYSBUS_CONTEXT}"
+                  and self.headers.get("Cookie") == SYSBUS_COOKIE)
+
+        if self.path == "/ws" and sah and self.headers.get("Authorization") == "X-Sah-Login":
+            parameters = sent.get("parameters", {})
+            if (sent.get("service") == "sah.Device.Information" and sent.get("method") == "createContext"
+                    and parameters.get("password") == SYSBUS_PASSWORD):
+                return self._json(200, {"status": 0, "data": {"contextID": SYSBUS_CONTEXT}},
+                                  set_cookie=f"{SYSBUS_COOKIE}; path=/; HttpOnly")
+            return self._json(401, {"status": 1, "data": {}})
+
+        if self.path == "/ws" and sah and sent.get("service") == "Devices" and sent.get("method") == "get":
+            if authed:
+                return self._json(200, {"status": [{"Name": "dev-1"}, {"Name": "dev-2"}]})
+            return self._json(401, {"status": None,
+                                    "errors": [{"error": 13, "description": "Permission denied",
+                                               "info": "Devices"}]})
+
+        if self.path == "/sysbus/DeviceInfo:get" and sah:
+            return self._json(200, {"status": {
+                "Manufacturer": "Arcadyan", "ModelName": "IB4-00", "SerialNumber": "SN-TEST-1",
+                "SoftwareVersion": "15.20.46", "UpTime": 93825,
+            }})
+
+        if self.path == "/sysbus/NMC:get" and sah:
+            return self._json(200, {"status": {"ActiveWANInterface": "XGS-PON", "ProvisioningState": "done"}})
+
+        # /sysbus/Devices:get is deliberately NOT handled: the real box
+        # answers "Permission denied" to it regardless of session, and this
+        # fake's 404 makes clear a caller using that shape gets nothing.
+        self._json(404, {"error": "not found"})
+
+    def _json(self, status, payload, set_cookie=None):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/x-sah-ws-4-call+json")
+        self.send_header("Content-Length", str(len(body)))
+        if set_cookie:
+            self.send_header("Set-Cookie", set_cookie)
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class SwisscomSysbusTests(unittest.TestCase):
+    """The confirmed read path: /sysbus over the SAH dialect, gated at /ws."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), SysbusHandler)
+        cls.server.daemon_threads = True
+        cls.address = f"127.0.0.1:{cls.server.server_address[1]}"
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        # The box only ever answers this dialect on https; the fake one here
+        # is plain HTTP, so this is the one seam swapped for the test.
+        cls.original_origin = swisscom._origin
+        swisscom._origin = lambda ip: f"http://{ip}"
+
+    @classmethod
+    def tearDownClass(cls):
+        swisscom._origin = cls.original_origin
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def test_public_status_needs_no_password(self):
+        raw = swisscom.snapshot({"ip": self.address, "password": ""})
+        self.assertEqual(raw["manufacturer"], "Arcadyan")
+        self.assertEqual(raw["model"], "IB4-00")
+        self.assertEqual(raw["firmware"], "15.20.46")
+        self.assertEqual(raw["wan_interface"], "XGS-PON")
+        self.assertEqual(raw["detail"], {})
+
+    def test_a_correct_password_signs_in_and_counts_devices(self):
+        raw = swisscom.snapshot({"ip": self.address, "password": SYSBUS_PASSWORD})
+        self.assertTrue(raw["detail"]["authenticated"])
+        self.assertEqual(raw["detail"]["device_count"], 2)
+
+    def test_a_wrong_password_is_reported_not_faked(self):
+        raw = swisscom.snapshot({"ip": self.address, "password": "nope"})
+        self.assertEqual(raw["detail"], {"error": "the box did not accept that password"})
+
+    def test_home_renders_what_was_actually_read(self):
+        raw = swisscom.snapshot({"ip": self.address, "password": SYSBUS_PASSWORD})
+        device = {"id": "swisscom-x", "ip": self.address, "name": "Internet-Box",
+                  "password": SYSBUS_PASSWORD, "source": "swisscom"}
+        built = swisscom.home(device, raw)["devices"][0]
+        values = {reading["label"]: reading["display"] for reading in built["readings"]}
+        self.assertEqual(values["Local API"], "Signed in")
+        self.assertEqual(values["Model"], "IB4-00")
+        self.assertEqual(values["Firmware"], "15.20.46")
+        self.assertEqual(values["Uptime"], "1d 2h 3m")
+        self.assertEqual(values["Devices on the network"], "2")
+        self.assertIn("XGS-PON", values["WAN"])
+        self.assertEqual(built["note"], "")  # nothing left to explain once signed in
+
+    def test_an_unreachable_box_raises_rather_than_faking_a_reading(self):
+        with self.assertRaises(swisscom.SwisscomError):
+            swisscom.snapshot({"ip": "127.0.0.1:1", "password": ""})
 
 
 class RegistryTests(unittest.TestCase):

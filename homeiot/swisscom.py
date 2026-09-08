@@ -1,32 +1,55 @@
 """The Swisscom Internet-Box.
 
 Swisscom does not publish this box's local API, and it is not the same across
-generations: the Internet-Box 4 is an Arcadyan PRV65AX, not the Sagemcom-based
-boxes whose ``/ws`` RPC is documented in the wild.  On a real IB4, ``/ws`` does
-not answer at all and ``/api/v1/...`` returns the box's own 404 page -- so the
-web server is there and the API simply lives somewhere else.
-
-Rather than guess at a third shape, the prober reads the box's own web
-interface: it fetches the page, follows the scripts it loads, and pulls the
-request paths out of them.  A single-page app has to name its endpoints
-somewhere, and that somewhere is its JavaScript.
+generations: the Internet-Box 4 is an Arcadyan IB4-00, not the Sagemcom-based
+boxes whose ``/ws`` RPC is documented in the wild.  A plain JSON POST to
+``/ws`` gets nothing back -- which is not the same as "nothing is there".
+The prober below exists to tell those apart, and reading it against a real
+IB4 answered the question: the box speaks the SoftAtHome ``sysbus`` dialect
+after all, just gated on things a generic guess would not think to vary.
 
     python3 -m homeiot --probe-box 10.0.0.1
 
-Reading a bundler's output takes more than looking for ``"/api/..."``: a
-modern build joins a base onto a relative path, so this collects every
-string that could be part of a URL and, more usefully, quotes the code
-around each ``fetch`` and ``new WebSocket`` so the joining itself is visible.
+The prober reads the box's own web interface -- fetches the page, follows
+the scripts it loads, and pulls the request paths out of them -- rather than
+guessing at a shape, because a single-page app has to name its endpoints
+somewhere, and that somewhere is its JavaScript. Reading a bundler's output
+takes more than looking for ``"/api/..."``: a modern build joins a base onto
+a relative path, so this collects every string that could be part of a URL
+and, more usefully, quotes the code around each ``fetch`` and
+``new WebSocket`` so the joining itself is visible.
 
 Two answers here are not failures but findings.  A path that resets the
 connection while every unknown path returns a tidy 404 is a path something
 is listening on -- ``/ws`` behaves exactly as a WebSocket route does when
 sent a plain POST -- so the prober offers it a real WebSocket handshake, and
 asks for a path that certainly does not exist as a control, to tell a
-route's refusal apart from the server's general dislike of a method.
+route's refusal apart from the server's general dislike of a method. On the
+real box that handshake gets its own plain 404: ``/ws`` is not a socket
+either. It is a POST that insists on a content type: sent as
+``application/x-sah-ws-4-call+json`` it answers with HTTP 401 and a real
+JSON body instead of dropping the connection, which is the SoftAtHome
+dialect identifying itself.
 
-Everything it finds is printed. That output is what the rest of this
-integration should be written against.
+What actually reads the box, once that dialect is known, is not this
+prober's guesswork but ``/sysbus/<Service>:<method>`` -- confirmed live:
+``DeviceInfo:get`` and ``NMC:get`` answer with no login at all. Logging in
+(``POST /ws``, ``sah.Device.Information.createContext``) is not, on its own,
+enough for the rest: the reply also sets an ``HttpOnly`` session cookie, and
+every gated call answers "Permission denied" for a real, correctly-obtained
+context sent without it -- ``core.min.js`` says as much in a comment ("user
+login is stored in two cookies"), which this file did not believe until a
+real login proved it. And the connected-device list is not
+``/sysbus/Devices:get`` at all -- that shape answers "Permission denied" no
+matter who asks, because the box's own webui never sends it. It is read
+exactly the way ``NetworkDevices.fetchDevices`` in the box's own
+``app.min.js`` reads it: ``POST /ws``, ``{"service": "Devices", "method":
+"get", "parameters": {"expression": "lan and not self and not interface"}}``.
+See ``_login``, ``_sysbus`` and ``_rpc`` below -- that is the confirmed API,
+not this file's search for it.
+
+Everything the prober finds is printed. That output is what a *new* box, or
+a firmware that changed shape, should be read against next.
 
 The MQTT service the box advertises is Swisscom's own, for their mesh
 repeaters; it needs credentials this cannot obtain, so it is left alone.
@@ -98,8 +121,12 @@ SAH_CALLS: tuple[tuple[str, Any], ...] = (
 # tool joins a base onto a relative path, so requiring a leading `/api` finds
 # nothing on a box that works perfectly well.
 STRING_PATTERN = re.compile(r"""['"`]([^'"`\\\r\n]{2,160})['"`]""")
-ASSET_PATTERN = re.compile(r"""(?:src|href)\s*=\s*['"]([^'"]+\.(?:js|mjs))['"]""", re.IGNORECASE)
-CHUNK_PATTERN = re.compile(r"""['"]([^'"\s]{1,120}\.m?js)['"]""")
+# A build that stamps a cache-busting ``?v=...`` onto its own script tags
+# (this box does) puts the extension *before* the closing quote, not at it --
+# requiring the quote right after ``.js`` silently skips exactly the asset
+# most worth reading.
+ASSET_PATTERN = re.compile(r"""(?:src|href)\s*=\s*['"]([^'"]+\.(?:js|mjs)(?:\?[^'"]*)?)['"]""", re.IGNORECASE)
+CHUNK_PATTERN = re.compile(r"""['"]([^'"\s]{1,120}\.m?js(?:\?[^'"\s]*)?)['"]""")
 TITLE_PATTERN = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
 ABSOLUTE_PATH = re.compile(r"/[A-Za-z0-9_.\-/:{}$%~+]*(?:\?[A-Za-z0-9_.\-/:{}$%=&]*)?")
@@ -227,11 +254,6 @@ def _ask(target: dict[str, str], method: str, path: str, payload: Any = None,
         "reached": True,
         "why": "",
     }
-
-
-def _try(ip: str, method: str, path: str, payload: Any = None,
-         timeout: float = TIMEOUT) -> dict[str, Any]:
-    return _ask(where(ip), method, path, payload, timeout)
 
 
 def _text(body: Any) -> str:
@@ -620,49 +642,196 @@ def discover(deep: bool = False) -> list[dict[str, Any]]:
 
 
 # --- reading -----------------------------------------------------------------
+# The box's own webui makes every real request the same way (core.min.js,
+# swc.constructors.Rest.sendRequest): the SAH content type, a JSON body of
+# {"parameters": {...}} (or {"service", "method", "parameters"} at /ws),
+# answered as {"status": ..., "errors": [...]} -- no "result" envelope, which
+# is what the `application/json` prober candidates get instead; the content
+# type picks the reply shape as well as whether the route answers at all.
+#
+# DeviceInfo:get and NMC:get answer that shape with no login. Everything else
+# tried needs a session -- and a session is *two* things, confirmed live only
+# after the first login attempt looked "rejected" while actually just missing
+# one of them: the contextID in the login reply, echoed back as
+# X-Context/Authorization, and an HttpOnly cookie the same reply sets. Either
+# alone gets "Permission denied"; core.min.js's own comment ("user login is
+# stored in two cookies") was the only advance warning of this.
+
+SAH_CONTENT_TYPE = "application/x-sah-ws-4-call+json"
+
+
+def _origin(ip: str) -> str:
+    """https, unconditionally: that is the only scheme the box itself answers
+    JSON on -- http redirects to it -- and it is the seam tests replace."""
+    return f"https://{ip}"
+
+
+def _call(ip: str, path: str, payload: dict[str, Any], session: dict[str, str] | None = None,
+          timeout: float = TIMEOUT) -> dict[str, Any] | list[Any] | None:
+    """One request in the box's own dialect. ``None`` means refused or unreachable."""
+    headers = {"Content-Type": SAH_CONTENT_TYPE}
+    if session:
+        headers["X-Context"] = session["context"]
+        headers["Authorization"] = f"X-Sah {session['context']}"
+        if session.get("cookie"):
+            headers["Cookie"] = session["cookie"]
+    try:
+        _, body = net.request("POST", f"{_origin(ip)}{path}", headers=headers,
+                              payload=payload, timeout=timeout, insecure=True)
+    except net.HttpError as error:
+        body = error.body
+    if not isinstance(body, dict) or body.get("errors"):
+        return None
+    status = body.get("status")
+    return status if isinstance(status, (dict, list)) else None
+
+
+def _sysbus(ip: str, service_method: str, parameters: dict[str, Any] | None = None,
+            session: dict[str, str] | None = None, timeout: float = TIMEOUT) -> dict[str, Any] | list[Any] | None:
+    """``POST /sysbus/<Service>:<method>`` -- the REST-shaped half of the dialect."""
+    return _call(ip, f"/sysbus/{service_method}", {"parameters": parameters or {}}, session, timeout)
+
+
+def _rpc(ip: str, service: str, method: str, parameters: dict[str, Any] | None = None,
+         session: dict[str, str] | None = None, timeout: float = TIMEOUT) -> dict[str, Any] | list[Any] | None:
+    """``POST /ws`` -- the ``{service, method}`` half; the device list lives here."""
+    return _call(ip, "/ws", {"service": service, "method": method, "parameters": parameters or {}},
+                 session, timeout)
+
+
+def _login(ip: str, password: str, timeout: float = TIMEOUT) -> dict[str, str]:
+    """The box's own login: POST /ws, createContext, read back a session.
+
+    This is the exact call ``core.min.js`` makes -- service, method, headers
+    and all (``sah.Device.Information.createContext``, username "admin",
+    ``Authorization: X-Sah-Login``). Confirmed live, including the part that
+    is easy to miss: the JSON reply's contextID is only half of it. The same
+    response also sets a session cookie, and a gated call made with the
+    contextID but not the cookie still answers "Permission denied" -- so both
+    travel together from here on, or the login is treated as refused.
+    """
+    headers = {"Content-Type": SAH_CONTENT_TYPE, "Authorization": "X-Sah-Login"}
+    payload = {"service": "sah.Device.Information", "method": "createContext",
+               "parameters": {"applicationName": "webui", "username": "admin", "password": password}}
+    try:
+        _, body, response_headers = net.request_with_headers(
+            "POST", f"{_origin(ip)}/ws", headers=headers, payload=payload, timeout=timeout, insecure=True)
+    except net.HttpError:
+        return {}
+    if not (isinstance(body, dict) and body.get("status") == 0):
+        return {}
+    context = (body.get("data") or {}).get("contextID", "")
+    if not context:
+        return {}
+    cookie = (response_headers.get("set-cookie") or "").split(";", 1)[0]
+    return {"context": context, "cookie": cookie} if cookie else {"context": context}
 
 
 def snapshot(device: dict[str, Any]) -> dict[str, Any]:
-    root = _try(device["ip"], "GET", "/", timeout=TIMEOUT)
-    if not root["reached"]:
+    ip = device["ip"]
+    info = _sysbus(ip, "DeviceInfo:get")
+    if info is None:
         raise SwisscomError("the box did not answer")
+    wan = _sysbus(ip, "NMC:get")
+    wan = wan if isinstance(wan, dict) else {}
     detail = _read_with_password(device) if device.get("password") else {}
-    return {"reachable": True, "detail": detail, "seen": time.time()}
+    return {
+        "reachable": True,
+        "manufacturer": info.get("Manufacturer", ""),
+        "model": info.get("ModelName", ""),
+        "serial": info.get("SerialNumber", ""),
+        "firmware": info.get("SoftwareVersion", ""),
+        "uptime": info.get("UpTime"),
+        "wan_interface": wan.get("ActiveWANInterface", ""),
+        "provisioning": wan.get("ProvisioningState", ""),
+        "detail": detail,
+        "seen": time.time(),
+    }
 
 
 def _read_with_password(device: dict[str, Any]) -> dict[str, Any]:
-    """Try the login shapes these boxes are known to accept.
+    """Log in, then read the device list the way the webui itself does.
 
-    None of them is confirmed for the Internet-Box 4; if none is accepted the
-    dashboard says the box was found but could not be read, rather than
-    inventing a status.
+    ``/sysbus/Devices:get`` looked like the natural REST shape and answers
+    "Permission denied" for a fully valid session too -- the box's own code
+    never sends it. What ``NetworkDevices.fetchDevices`` actually sends,
+    confirmed live, is a ``/ws`` RPC call naming an expression: "everything
+    on the LAN that is not the box itself and not one of its own interfaces".
+    Read as a count rather than parsed field by field, since the per-device
+    shape (name, IP, MAC, ...) was seen but is not yet relied on by anything.
     """
-    ip, password = device["ip"], device["password"]
-    attempts = (
-        ("POST", "/api/v1/login", {"username": "admin", "password": password}),
-        ("POST", "/api/login", {"username": "admin", "password": password}),
-        ("POST", "/ws", {"service": "sah.Device.Information", "method": "createContext",
-                         "parameters": {"applicationName": "webui", "username": "admin",
-                                        "password": password}}),
-    )
-    for method, path, payload in attempts:
-        result = _try(ip, method, path, payload, TIMEOUT)
-        if result["reached"] and result["status"] and result["status"] < 400 and isinstance(result["body"], dict):
-            return {"dialect": path, "login": result["body"]}
-    return {"error": "none of the known login shapes was accepted"}
+    session = _login(device["ip"], device["password"])
+    if not session:
+        return {"error": "the box did not accept that password"}
+    devices = _rpc(device["ip"], "Devices", "get",
+                   {"expression": "lan and not self and not interface", "flags": "no_actions"},
+                   session=session)
+    detail: dict[str, Any] = {"authenticated": True}
+    if isinstance(devices, (dict, list)):
+        detail["device_count"] = len(devices)
+    return detail
+
+
+def _uptime(seconds: Any) -> str:
+    """``UpTime`` is whole seconds since boot; shown the way a person reads it."""
+    try:
+        total = int(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if total < 0:
+        return ""
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    parts = ([f"{days}d"] if days else []) + ([f"{hours}h"] if hours or days else []) + [f"{minutes}m"]
+    return " ".join(parts)
 
 
 def home(device: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
     detail = raw.get("detail") or {}
-    readable = bool(detail) and "error" not in detail
+    signed_in = bool(detail.get("authenticated"))
+    password_rejected = bool(device.get("password")) and "error" in detail
+
     readings = [
         {"kind": "presence", "label": "Reachable", "value": bool(raw.get("reachable")),
          "display": "Yes" if raw.get("reachable") else "No", "valid": True},
-        {"kind": "activity", "label": "Local API", "value": readable,
-         "display": "Signed in" if readable
-         else ("Password not accepted" if device.get("password") else "No password set"),
+        {"kind": "activity", "label": "Local API", "value": signed_in,
+         "display": "Signed in" if signed_in
+         else ("Password not accepted" if password_rejected else "No password set"),
          "valid": True},
     ]
+    if raw.get("model"):
+        readings.append({"kind": "info", "label": "Model", "value": raw["model"],
+                         "display": raw["model"], "valid": True})
+    if raw.get("firmware"):
+        readings.append({"kind": "info", "label": "Firmware", "value": raw["firmware"],
+                         "display": raw["firmware"], "valid": True})
+    if raw.get("serial"):
+        readings.append({"kind": "serial", "label": "Serial", "value": raw["serial"],
+                         "display": raw["serial"], "valid": True})
+    shown_uptime = _uptime(raw.get("uptime"))
+    if shown_uptime:
+        readings.append({"kind": "info", "label": "Uptime", "value": raw.get("uptime"),
+                         "display": shown_uptime, "valid": True})
+    if raw.get("wan_interface"):
+        display = raw["wan_interface"]
+        if raw.get("provisioning"):
+            display = f"{display} ({raw['provisioning']})"
+        readings.append({"kind": "network", "label": "WAN", "value": raw["wan_interface"],
+                         "display": display, "valid": True})
+    if "device_count" in detail:
+        readings.append({"kind": "count", "label": "Devices on the network",
+                         "value": detail["device_count"], "display": str(detail["device_count"]),
+                         "valid": True})
+
+    note = ""
+    if not device.get("password"):
+        note = ("Reads model, firmware and WAN status without a password. The box's own "
+                "password (printed underneath it) additionally unlocks the list of devices "
+                "on your network.")
+    elif not signed_in:
+        note = "That password was not accepted, so only the box's public status is shown."
+
     return {
         "devices": [
             {
@@ -672,10 +841,10 @@ def home(device: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
                 "bridge": device["id"],
                 "kind": "router",
                 "name": device.get("name", "Internet-Box"),
-                "product": device.get("model", "Swisscom Internet-Box"),
-                "manufacturer": "Swisscom",
-                "model": device.get("model", ""),
-                "software": "",
+                "product": raw.get("model") or device.get("model", "Swisscom Internet-Box"),
+                "manufacturer": raw.get("manufacturer") or "Swisscom",
+                "model": raw.get("model") or device.get("model", ""),
+                "software": raw.get("firmware", ""),
                 "archetype": "router",
                 "room": None,
                 "room_name": None,
@@ -688,12 +857,7 @@ def home(device: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
                 "battery": None,
                 "lights": [],
                 "scenes": [],
-                "note": (
-                    "This box's local API is not published, and the Internet-Box 4 does not answer "
-                    "the shapes the older ones did. Run `python3 -m homeiot --probe-box "
-                    f"{device.get('ip', '')}` — it reads the box's own web app and reports the "
-                    "endpoints it calls, which is what the rest of this needs."
-                ),
+                "note": note,
             }
         ],
         "groups": [],
