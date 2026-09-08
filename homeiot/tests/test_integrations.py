@@ -336,6 +336,117 @@ class AnnouncementTests(unittest.TestCase):
         self.assertEqual(found["name"], "Siemens Hob")
 
 
+# --- a fake Internet-Box -----------------------------------------------------
+# An Arcadyan-style box: a single-page app whose scripts name the endpoints,
+# which is exactly what the prober is there to read.
+
+BOX_PAGE = """<!DOCTYPE html><html><head><title>Internet-Box</title>
+<meta name="viewport" content="width=device-width"></head>
+<body><div id="app"></div>
+<script src="/static/js/chunk-vendors.4f1a.js"></script>
+<script src="/static/js/app.9c2b.js"></script>
+<script src="https://example.invalid/tracker.js"></script>
+</body></html>"""
+
+BOX_APP_JS = """
+!function(){var e={login:"/api/v1/session",info:"/api/v1/system/deviceinfo",
+hosts:"/api/v1/network/hosts",legacy:'/data/status.json',
+socket:"/ws/events"};
+axios.get("/api/v1/system/deviceinfo").then(...);
+var t="not/a/path";var u="/assets/logo.svg";
+}();
+"""
+
+
+class BoxHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/":
+            return self._send(200, BOX_PAGE, "text/html")
+        if self.path.endswith("app.9c2b.js"):
+            return self._send(200, BOX_APP_JS, "application/javascript")
+        if self.path.endswith("chunk-vendors.4f1a.js"):
+            return self._send(200, "/* vendor bundle, nothing of ours */", "application/javascript")
+        if self.path == "/api/v1/system/deviceinfo":
+            return self._send(200, json.dumps({"model": "PRV65AX", "firmware": "15.20.46"}),
+                              "application/json")
+        if self.path == "/api/v1/session":
+            return self._send(401, json.dumps({"error": "unauthorised"}), "application/json")
+        self._send(404, "<html><head><title>Not Found</title></head><body>404</body></html>", "text/html")
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        self._send(404, "<html>404</html>", "text/html")
+
+    def _send(self, status, body, content_type):
+        payload = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+class InternetBoxProbeTests(unittest.TestCase):
+    """The prober has to find the API by reading the box's own web app."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), BoxHandler)
+        cls.server.daemon_threads = True
+        cls.address = f"127.0.0.1:{cls.server.server_address[1]}"
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.found = swisscom.survey(cls.address, timeout=3.0)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def test_the_box_is_recognised_by_its_own_page(self):
+        self.assertEqual(self.found["title"], "Internet-Box")
+        self.assertTrue(self.found["reachable"])
+        described = swisscom.probe(self.address, timeout=3.0)
+        self.assertEqual(described["name"], "Internet-Box")
+        self.assertEqual(described["source"], "swisscom")
+
+    def test_it_follows_the_scripts_the_page_loads(self):
+        urls = [asset["url"] for asset in self.found["assets"]]
+        self.assertTrue(any("app.9c2b.js" in url for url in urls), urls)
+        self.assertTrue(any("chunk-vendors" in url for url in urls), urls)
+        # Somebody else's CDN is not this box's API.
+        self.assertFalse(any("example.invalid" in url for url in urls), urls)
+
+    def test_it_pulls_the_endpoints_out_of_them(self):
+        mentioned = self.found["mentioned"]
+        for path in ("/api/v1/session", "/api/v1/system/deviceinfo", "/api/v1/network/hosts",
+                     "/data/status.json", "/ws/events"):
+            self.assertIn(path, mentioned)
+        self.assertNotIn("not/a/path", mentioned)  # relative, and not an endpoint
+
+    def test_it_then_asks_for_what_it_found(self):
+        answered = {item["path"]: item for item in self.found["discovered"] if item["status"] == 200}
+        self.assertIn("/api/v1/system/deviceinfo", answered)
+        self.assertTrue(answered["/api/v1/system/deviceinfo"]["json"])
+        self.assertIn("PRV65AX", answered["/api/v1/system/deviceinfo"]["sample"])
+
+    def test_the_old_shapes_are_reported_as_missing_not_as_working(self):
+        by_path = {item["path"]: item for item in self.found["candidates"]}
+        self.assertEqual(by_path["/api/v1/general/deviceinfo"]["status"], 404)
+        self.assertEqual(by_path["/ws"]["status"], 404)
+
+    def test_the_report_is_readable_and_complete(self):
+        text = swisscom.report(self.found)
+        self.assertIn("Internet-Box", text)
+        self.assertIn("/api/v1/system/deviceinfo", text)
+        self.assertIn("scripts read: 2", text)
+        self.assertIn("Paste this back", text)
+
+
 class SwisscomTests(unittest.TestCase):
     def test_it_reports_what_it_could_not_do(self):
         device = {"id": "swisscom-192-168-1-1", "ip": "192.168.1.1", "name": "Internet-Box",

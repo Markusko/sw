@@ -582,22 +582,11 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.probe_box:
         from . import swisscom
 
-        print(f"asking {arguments.probe_box} what it answers:\n")
-        for result in swisscom.survey(arguments.probe_box):
-            head = f"  {result['probe']:<18} {result['path']:<28}"
-            if not result["answered"]:
-                print(f"{head} no answer")
-                continue
-            marks = []
-            if result.get("json"):
-                marks.append("JSON")
-            if result.get("looks_like_the_box"):
-                marks.append("names itself")
-            print(f"{head} HTTP {result['status']} {' '.join(marks)}")
-            sample = str(result.get("sample", "")).strip().replace("\n", " ")[:200]
-            if sample:
-                print(f"      {sample}")
-        print("\nSend this output along and the integration can be written against it.")
+        address = arguments.probe_box
+        if address is True or address == "auto":
+            address = swisscom.gateway_candidates()[0]
+        print(f"reading {address} — this follows the box's own web app, so give it a moment\n")
+        print(swisscom.report(swisscom.survey(address)))
         return 0
 
     serve(arguments.host, arguments.port, arguments.demo, arguments.token, arguments.verbose)
