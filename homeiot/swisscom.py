@@ -877,6 +877,29 @@ def _moment(value: Any) -> float | None:
         return None
 
 
+RX_NAMES = ("RxBytes", "BytesReceived", "RxBytesCounter", "Rx", "DownstreamBytes")
+TX_NAMES = ("TxBytes", "BytesSent", "TxBytesCounter", "Tx", "UpstreamBytes")
+
+
+def _counters(entry: Any, interface: str = WAN_INTERFACE) -> dict[str, Any]:
+    """The WAN interface's own counters, out of an entry covering several.
+
+    A log entry is one moment across every interface the box has -- the fibre
+    and its internal bridges alike -- so the totals sit one level down, under
+    the interface's name.  Reading the entry itself finds nothing, which is
+    what the first version of this did.
+    """
+    if not isinstance(entry, dict):
+        return {}
+    named = _pick(entry, interface)
+    if isinstance(named, dict):
+        return named
+    if _pick(entry, *RX_NAMES) is not None:  # or flat, on a box with one WAN
+        return entry
+    return next((value for value in entry.values()
+                 if isinstance(value, dict) and _pick(value, *RX_NAMES) is not None), {})
+
+
 def samples_in(log: Any) -> list[tuple[float, float, float]]:
     """(when, bytes in, bytes out) for every entry that carries all three.
 
@@ -889,10 +912,9 @@ def samples_in(log: Any) -> list[tuple[float, float, float]]:
     found = []
     for entry in entries or []:
         when = _moment(_pick(entry, "Timestamp", "Time", "Date", "Epoch", "SampleTime"))
-        received = _number(_pick(entry, "RxBytes", "BytesReceived", "RxBytesCounter",
-                                 "Rx", "DownstreamBytes"))
-        sent = _number(_pick(entry, "TxBytes", "BytesSent", "TxBytesCounter",
-                             "Tx", "UpstreamBytes"))
+        counters = _counters(entry)
+        received = _number(_pick(counters, *RX_NAMES))
+        sent = _number(_pick(counters, *TX_NAMES))
         if when is not None and received is not None and sent is not None:
             found.append((when, received, sent))
     return sorted(found)
@@ -925,25 +947,29 @@ def throughput_from(samples: list[tuple[float, float, float]]) -> dict[str, Any]
     }
 
 
-def _scaled(value: Any, plausible: float) -> float | None:
-    """One number, two units, and nothing in the reply that says which.
+SCALES = (1, 10, 100, 1000)  # whole units, tenths, hundredths, thousandths
+# What the hardware can physically mean, which is what decides the scale.
+RX_RANGE = (-40.0, 10.0)   # received optical power, dBm
+TX_RANGE = (-10.0, 20.0)   # transmitted optical power, dBm
+HEAT_RANGE = (-20.0, 120.0)  # transceiver temperature, C
 
-    These MIBs report optical power and temperature either in whole units or
-    in tenths, and it differs between firmwares.  Physics decides: a value
-    past anything the hardware could mean is the tenths form -- -182 is
-    -18.2 dBm, not a signal no fibre carries; 441 is 44.1 C, not a router on
-    fire.  The limit is per field, because the plausible range is: received
-    power runs to about -40 dBm, transmitted power only to about +10, so the
-    same +25 that would be a real number for one is tenths for the other.
-    `--probe-wan` prints the raw values to check this against a real box.
+
+def _measure(value: Any, low: float, high: float) -> float | None:
+    """One number, several possible units, and nothing that says which.
+
+    A live IB4 reports optical power in thousandths of a dBm (-14841 is
+    -14.841 dBm) and temperature in whole degrees, in the same reply, under
+    fields that look alike.  Other firmwares in this family use tenths.  So
+    the scale is not assumed: the smallest one that lands the value inside
+    what the hardware could physically mean is the right one, and a value
+    that lands nowhere plausible at any scale is returned as unknown rather
+    than as a number.  Trying the scales smallest-first matters -- -182 is
+    -18.2 dBm and not -0.182, and both are inside the range.
     """
     number = _number(value)
     if number is None:
         return None
-    return number / 10 if abs(number) > plausible else number
-
-
-RX_LIMIT, TX_LIMIT, HEAT_LIMIT = 40.0, 10.0, 100.0
+    return next((number / scale for scale in SCALES if low <= number / scale <= high), None)
 
 
 def line_from(mibs: Any) -> dict[str, Any]:
@@ -960,9 +986,10 @@ def line_from(mibs: Any) -> dict[str, Any]:
     return {
         "valid": True,
         "why": "",
-        "rx_dbm": _scaled(_pick(fields, "SignalRxPower", "RxPower", "OpticalSignalLevel"), RX_LIMIT),
-        "tx_dbm": _scaled(_pick(fields, "SignalTxPower", "TxPower", "TransmitOpticalLevel"), TX_LIMIT),
-        "celsius": _scaled(_pick(fields, "Temperature", "TransceiverTemperature"), HEAT_LIMIT),
+        "rx_dbm": _measure(_pick(fields, "SignalRxPower", "RxPower", "OpticalSignalLevel"), *RX_RANGE),
+        "tx_dbm": _measure(_pick(fields, "SignalTxPower", "TxPower", "TransmitOpticalLevel"), *TX_RANGE),
+        "celsius": _measure(_pick(fields, "Temperature", "TransceiverTemperature"), *HEAT_RANGE),
+        "mode": _pick(fields, "PonMode") or "",
         # Some firmwares answer in kbit/s, some in Mbit/s; a home line is not
         # a million Mbit/s, so the larger number is the smaller unit.
         "rate_mbps": (rate / 1000 if rate and rate > 1e6 else rate),
@@ -1050,9 +1077,16 @@ def _reading(kind: str, label: str, value: Any, display: str, unit: str = "") ->
 
 
 def _rate(mbps: float | None) -> str:
+    """A speed in the unit a person would say it in.
+
+    An idle upload is a fraction of a megabit, and "0.2 Mbps" reads like a
+    rounding artefact where "173 kbps" reads like a measurement.
+    """
     if mbps is None:
         return ""
-    return f"{mbps / 1000:.1f} Gbps" if mbps >= 1000 else f"{mbps:.1f} Mbps"
+    if mbps >= 1000:
+        return f"{mbps / 1000:.1f} Gbps"
+    return f"{mbps:.1f} Mbps" if mbps >= 1 else f"{mbps * 1000:.0f} kbps"
 
 
 def _wan_readings(raw: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1084,8 +1118,10 @@ def _wan_readings(raw: dict[str, Any]) -> list[dict[str, Any]]:
         readings += [_reading(kind, label, value, shape.format(value), unit)
                      for kind, label, value, unit, shape in optical if value is not None]
         if line.get("rate_mbps"):
+            shown = _rate(line["rate_mbps"])
             readings.append(_reading("line_rate", "Line rate", line["rate_mbps"],
-                                     _rate(line["rate_mbps"]), "Mbps"))
+                                     f"{shown} {line['mode']}".strip() if line.get("mode") else shown,
+                                     "Mbps"))
     return readings
 
 

@@ -567,11 +567,19 @@ SYSBUS_COOKIES = ("deviceid/sessid=cookie-xyz", "sah/context=ctx-cookie")
 SYSBUS_COOKIE = "; ".join(SYSBUS_COOKIES)
 
 
-# Ten seconds apart, as the box logs them: 12.5 MB down and 1.25 MB up in
-# that time, which is 10 Mbps and 1 Mbps.
+# Copied from a live IB4, shape and all: one entry per moment covering every
+# interface, the WAN's counters nested under its name, and an ISO timestamp.
+# Ten seconds apart, 23,094,605 bytes down and 216,195 up, which is
+# 18.48 Mbps and 173 kbps.
 SYSBUS_SAMPLES = [
-    {"Timestamp": 1_700_000_000, "RxBytes": 1_000_000_000, "TxBytes": 500_000_000},
-    {"Timestamp": 1_700_000_010, "RxBytes": 1_012_500_000, "TxBytes": 501_250_000},
+    {"veip0": {"RxPackets": 4227783041, "TxPackets": 1663427507,
+               "RxBytes": 4337899574212, "TxBytes": 495619127905},
+     "brmptcp": {"RxPackets": 0, "TxPackets": 255890, "RxBytes": 0, "TxBytes": 75999330},
+     "Timestamp": "2026-09-08T16:15:59Z"},
+    {"veip0": {"RxPackets": 4227799808, "TxPackets": 1663430028,
+               "RxBytes": 4337922668817, "TxBytes": 495619344100},
+     "brmptcp": {"RxPackets": 0, "TxPackets": 255890, "RxBytes": 0, "TxBytes": 75999330},
+     "Timestamp": "2026-09-08T16:16:09Z"},
 ]
 
 
@@ -627,10 +635,15 @@ class SysbusHandler(BaseHTTPRequestHandler):
         if self.path == "/sysbus/NeMo/Intf/veip0:getMIBs" and sah:
             if not authed:
                 return self._json(401, {"errors": [{"error": 13, "description": "Permission denied"}]})
+            # As a live IB4 answers: power in thousandths of a dBm, temperature
+            # in whole degrees, rate in Mbit/s -- three different scales in one
+            # reply, none of them labelled.
             return self._json(200, {"status": {"gpon": {"veip0": {
-                # Tenths, as this family reports them.
-                "SignalRxPower": -182, "SignalTxPower": 25, "Temperature": 441,
-                "MaxBitRateSupported": 10_000_000,  # kbit/s
+                "RegistrationID": "", "VeipPptpUni": True, "MaxBitRateSupported": 10_000,
+                "SignalRxPower": -14841, "SignalTxPower": 6866, "Temperature": 35,
+                "Voltage": 33984, "Bias": 34896, "PonMode": "XGS-PON",
+                "SerialNumber": "ARCA23360CC7", "ONTSoftwareVersion0": "15.20.46",
+                "LowerOpticalThreshold": -127500, "UpperOpticalThreshold": -127500,
             }}}})
 
         # /sysbus/Devices:get is deliberately NOT handled: the real box
@@ -738,17 +751,29 @@ class SwisscomSysbusTests(unittest.TestCase):
         self.assertEqual(built["note"], "")  # nothing left to explain once signed in
 
     def test_wan_speed_is_the_difference_between_two_counters(self):
+        """The counters are nested under the interface, not at the top."""
         raw = swisscom.snapshot({"ip": self.address, "password": SYSBUS_PASSWORD})
-        self.assertAlmostEqual(raw["throughput"]["down"], 10.0, places=3)
-        self.assertAlmostEqual(raw["throughput"]["up"], 1.0, places=3)
+        self.assertAlmostEqual(raw["throughput"]["down"], 18.475684, places=5)
+        self.assertAlmostEqual(raw["throughput"]["up"], 0.172956, places=5)
 
     def test_the_line_is_read_in_the_units_a_person_uses(self):
         raw = swisscom.snapshot({"ip": self.address, "password": SYSBUS_PASSWORD})
         line = raw["line"]
-        self.assertAlmostEqual(line["rx_dbm"], -18.2)   # -182 tenths of a dBm
-        self.assertAlmostEqual(line["tx_dbm"], 2.5)     # +25 tenths, not +25 dBm
-        self.assertAlmostEqual(line["celsius"], 44.1)
-        self.assertEqual(line["rate_mbps"], 10_000)     # 10 Gbit/s, given in kbit/s
+        self.assertAlmostEqual(line["rx_dbm"], -14.841)  # thousandths of a dBm
+        self.assertAlmostEqual(line["tx_dbm"], 6.866)
+        self.assertAlmostEqual(line["celsius"], 35.0)    # whole degrees, same reply
+        self.assertEqual(line["rate_mbps"], 10_000)      # already Mbit/s
+        self.assertEqual(line["mode"], "XGS-PON")
+
+    def test_a_scale_is_chosen_by_what_the_hardware_could_mean(self):
+        """Other firmwares report tenths; -182 is -18.2 dBm, not -0.182."""
+        self.assertAlmostEqual(swisscom._measure(-182, *swisscom.RX_RANGE), -18.2)
+        self.assertAlmostEqual(swisscom._measure(-14841, *swisscom.RX_RANGE), -14.841)
+        self.assertAlmostEqual(swisscom._measure(-18.2, *swisscom.RX_RANGE), -18.2)
+        self.assertAlmostEqual(swisscom._measure(441, *swisscom.HEAT_RANGE), 44.1)
+        self.assertAlmostEqual(swisscom._measure(35, *swisscom.HEAT_RANGE), 35.0)
+        # A sentinel threshold is not a reading at any scale.
+        self.assertIsNone(swisscom._measure(-127500, *swisscom.RX_RANGE))
 
     def test_the_wan_readings_reach_the_card(self):
         device = {"id": "swisscom-x", "ip": self.address, "name": "Internet-Box",
@@ -756,10 +781,11 @@ class SwisscomSysbusTests(unittest.TestCase):
         raw = swisscom.snapshot(device)
         built = swisscom.home(device, raw)["devices"][0]
         values = {reading["label"]: reading["display"] for reading in built["readings"]}
-        self.assertEqual(values["Download"], "10.0 Mbps")
-        self.assertEqual(values["Upload"], "1.0 Mbps")
-        self.assertEqual(values["Optical RX"], "-18.2 dBm")
-        self.assertEqual(values["Line rate"], "10.0 Gbps")
+        self.assertEqual(values["Download"], "18.5 Mbps")
+        self.assertEqual(values["Upload"], "173 kbps")  # not "0.2 Mbps"
+        self.assertEqual(values["Optical RX"], "-14.8 dBm")
+        self.assertEqual(values["Transceiver"], "35.0 °C")
+        self.assertEqual(values["Line rate"], "10.0 Gbps XGS-PON")
 
     def test_each_value_is_its_own_kind_so_a_room_can_pin_one(self):
         """resolve_readouts takes the first reading of a kind: sharing one
