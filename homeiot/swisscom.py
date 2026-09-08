@@ -35,6 +35,7 @@ repeaters; it needs credentials this cannot obtain, so it is left alone.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import socket
@@ -48,6 +49,10 @@ from . import model, net
 SOURCE = "swisscom"
 TIMEOUT = 5.0
 DEFAULT_ADDRESS = "192.168.1.1"
+# The name the box redirects to.  It is resolved by *never* resolving it: we
+# connect to the box's own address and pass this as the Host header, so the
+# request stays in the house.
+CANONICAL_HOST = "internetbox.swisscom.ch"
 ASSET_LIMIT = 20  # scripts to follow; a router's web app is not large
 ASSET_BYTES = 4_000_000
 
@@ -77,6 +82,17 @@ CONTROLS: tuple[tuple[str, str, Any], ...] = (
 )
 
 FINGERPRINTS = ("internet-box", "internetbox", "swisscom", "arcadyan")
+
+# The SoftAtHome JSON-RPC the older boxes speak.  A plain JSON POST to /ws is
+# refused by it; the content type is part of the protocol, not decoration, so
+# the earlier probes could not have told a wrong dialect from a missing route.
+SAH_HEADERS = {"Content-Type": "application/x-sah-ws-4-call+json", "Authorization": "X-Sah-Login"}
+SAH_CALLS: tuple[tuple[str, Any], ...] = (
+    ("/ws", {"service": "sah.Device.Information", "method": "createContext",
+             "parameters": {"applicationName": "webui", "username": "guest", "password": "guest"}}),
+    ("/ws", {"service": "DeviceInfo", "method": "get", "parameters": {}}),
+    ("/ws/NeMo/Intf/data", {"service": "NeMo.Intf.data", "method": "getMIBs", "parameters": {}}),
+)
 
 # Every quoted string in a bundle, then judged rather than matched: a build
 # tool joins a base onto a relative path, so requiring a leading `/api` finds
@@ -113,48 +129,179 @@ class SwisscomError(Exception):
 
 
 # --- asking politely ---------------------------------------------------------
+# Written on raw sockets rather than urllib, for three reasons this box makes
+# necessary: the reply headers are evidence (a Location names the hostname the
+# box wants to be called by), the Host header has to be ours to set, and a
+# redirect must NOT be followed -- chasing one to internetbox.swisscom.ch would
+# leave the house and ask Swisscom about a box sitting in the next room.
+
+
+def where(ip: str, scheme: str = "http", host: str = "") -> dict[str, str]:
+    """A place to ask: a scheme, an address, and the name to ask it by."""
+    return {"scheme": scheme, "ip": ip, "host": host}
+
+
+def describe(target: dict[str, str]) -> str:
+    named = f" as {target['host']}" if target["host"] else ""
+    return f"{target['scheme']}://{target['ip']}{named}"
+
+
+def _dechunk(raw: bytes) -> bytes:
+    pieces, rest = [], raw
+    while True:
+        size_line, sep, rest = rest.partition(b"\r\n")
+        if not sep:
+            break
+        try:
+            size = int(size_line.split(b";")[0] or b"0", 16)
+        except ValueError:
+            return b"".join(pieces) or raw
+        if size == 0:
+            break
+        pieces.append(rest[:size])
+        rest = rest[size + 2:]
+    return b"".join(pieces)
+
+
+def _body(raw: bytes) -> Any:
+    if not raw:
+        return None
+    text = raw.decode("utf-8", "replace")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def _ask(target: dict[str, str], method: str, path: str, payload: Any = None,
+         timeout: float = TIMEOUT, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    """One request, described rather than raised."""
+    scheme, ip, host = target["scheme"], target["ip"], target["host"]
+    if path.startswith("http"):  # an absolute URL carries its own destination
+        split = urlsplit(path)
+        scheme, ip, path = split.scheme, split.netloc, split.path or "/"
+    name, _, port = ip.partition(":")
+    sent = b"" if payload is None else json.dumps(payload).encode()
+    lines = [f"{method} {path} HTTP/1.1", f"Host: {host or ip}", "Accept: */*",
+             "User-Agent: homeiot-probe", "Connection: close",
+             *(f"{key}: {value}" for key, value in (headers or {}).items())]
+    if sent:
+        lines += [f"Content-Length: {len(sent)}"]
+        if not (headers or {}).get("Content-Type"):
+            lines += ["Content-Type: application/json"]
+    request = ("\r\n".join(lines) + "\r\n\r\n").encode() + sent
+
+    missed = {"path": path, "method": method, "status": None, "headers": {},
+              "body": None, "reached": False}
+    try:
+        link = socket.create_connection((name, int(port or (443 if scheme == "https" else 80))),
+                                        timeout=timeout)
+        if scheme == "https":
+            link = net.INSECURE_CONTEXT.wrap_socket(link, server_hostname=host or name)
+        with link:
+            link.sendall(request)
+            chunks: list[bytes] = []
+            while sum(map(len, chunks)) < ASSET_BYTES:
+                piece = link.recv(65536)
+                if not piece:
+                    break
+                chunks.append(piece)
+    except (OSError, ValueError) as error:
+        return {**missed, "why": str(error)}
+
+    head, _, rest = b"".join(chunks).partition(b"\r\n\r\n")
+    lines_back = head.decode("utf-8", "replace").splitlines()
+    if not lines_back:
+        return {**missed, "why": "closed without answering"}
+    first = lines_back[0].split()
+    answered = {key.strip().lower(): value.strip()
+                for key, _, value in (line.partition(":") for line in lines_back[1:])}
+    if answered.get("transfer-encoding", "").lower() == "chunked":
+        rest = _dechunk(rest)
+    return {
+        "path": path,
+        "method": method,
+        "status": int(first[1]) if len(first) > 1 and first[1].isdigit() else None,
+        "headers": answered,
+        "body": _body(rest),
+        "reached": True,
+        "why": "",
+    }
 
 
 def _try(ip: str, method: str, path: str, payload: Any = None,
          timeout: float = TIMEOUT) -> dict[str, Any]:
-    """One request, described rather than raised."""
-    url = path if path.startswith("http") else f"http://{ip}{path}"
-    try:
-        status, body = net.request(method, url, payload=payload, timeout=timeout)
-        return {"path": path, "method": method, "status": status, "body": body, "reached": True}
-    except net.HttpError as error:
-        # A 401 or 404 is still an answer: the server is there.
-        return {
-            "path": path,
-            "method": method,
-            "status": error.status or None,
-            "body": error.body,
-            "reached": bool(error.status),
-            "why": "" if error.status else str(error).rpartition("-> ")[2],
-        }
+    return _ask(where(ip), method, path, payload, timeout)
 
 
 def _text(body: Any) -> str:
     return body if isinstance(body, str) else ""
 
 
+def _title(page: str) -> str:
+    found = TITLE_PATTERN.search(page)
+    return found.group(1).strip() if found else ""
+
+
+def hosts_in(results: list[dict[str, Any]]) -> list[str]:
+    """The names the box redirects to: it is telling us what to call it."""
+    found: dict[str, None] = {}
+    for item in results:
+        location = (item.get("headers") or {}).get("location", "")
+        hostname = urlsplit(location).hostname if location.startswith("http") else ""
+        if hostname:
+            found.setdefault(hostname, None)
+    return list(found)
+
+
+def origins(ip: str, hints: list[str] | None = None) -> list[dict[str, str]]:
+    """Every way the box might want to be spoken to, plainest first."""
+    names = ["", *dict.fromkeys([*(hints or []), CANONICAL_HOST])]
+    return [where(ip, scheme, host) for host in names for scheme in ("http", "https")]
+
+
+def front_pages(ip: str, timeout: float = TIMEOUT) -> list[dict[str, Any]]:
+    """Ask each of them for the front page and see which is really the box.
+
+    A first pass by bare IP, then a second pass using whatever hostname the
+    first pass redirected to -- the box names itself in its own Location.
+    """
+    plain = [{"target": target, **_ask(target, "GET", "/", timeout=timeout)}
+             for target in origins(ip)[:2]]
+    hinted = origins(ip, hosts_in(plain))
+    seen = {describe(item["target"]) for item in plain}
+    rest = [{"target": target, **_ask(target, "GET", "/", timeout=timeout)}
+            for target in hinted if describe(target) not in seen]
+    return [{**item, "title": _title(_text(item.get("body")))} for item in plain + rest]
+
+
+def pick(pages: list[dict[str, Any]]) -> dict[str, str]:
+    """The one that answers with the box's own page, preferring the plainest."""
+    named = [item for item in pages if item["status"] == 200 and item["title"]]
+    working = named or [item for item in pages if item["status"] == 200]
+    return (working[0] if working else pages[0])["target"]
+
+
 # --- reading the box's own web app -------------------------------------------
 
 
-def assets_of(ip: str, timeout: float = TIMEOUT) -> list[str]:
+def assets_of(target: dict[str, str] | str, page: str = "", timeout: float = TIMEOUT) -> list[str]:
     """The scripts the front page pulls in."""
-    root = _try(ip, "GET", "/", timeout=timeout)
-    page = _text(root.get("body"))
+    spot = where(target) if isinstance(target, str) else target
+    if not page:
+        page = _text(_ask(spot, "GET", "/", timeout=timeout).get("body"))
     if not page:
         return []
+    base = f"{spot['scheme']}://{spot['ip']}/"
+    own = (spot["ip"].split(":")[0], spot["host"], None)
     found = []
     for reference in ASSET_PATTERN.findall(page):
         if reference.startswith(("http://", "https://")):
-            if urlsplit(reference).hostname not in (ip.split(":")[0], None):
+            if urlsplit(reference).hostname not in own:
                 continue  # only this box's own assets
             found.append(reference)
         else:
-            found.append(urljoin(f"http://{ip}/", reference))
+            found.append(urljoin(base, reference))
     return list(dict.fromkeys(found))[:ASSET_LIMIT]
 
 
@@ -252,48 +399,71 @@ def snippets_in(sources: list[str], limit: int = 18, apart: int = 150) -> list[s
     return list(seen)[:limit]
 
 
-def chunks_in(ip: str, sources: list[str], known: list[str]) -> list[str]:
+def chunks_in(target: dict[str, str] | str, sources: list[str], known: list[str]) -> list[str]:
     """Scripts the bundle loads for itself, which the page never mentions."""
+    spot = where(target) if isinstance(target, str) else target
+    base = f"{spot['scheme']}://{spot['ip']}/"
     already = set(known)
     found: dict[str, None] = {}
     for text in sources:
         for reference in CHUNK_PATTERN.findall(text[:ASSET_BYTES]):
             if reference.startswith(("http://", "https://")):
                 continue
-            url = urljoin(f"http://{ip}/", reference.lstrip("./"))
+            url = urljoin(base, reference.lstrip("./"))
             if url not in already:
                 found.setdefault(url, None)
     return list(found)[:ASSET_LIMIT]
 
 
-def websocket_probe(ip: str, path: str = "/ws", timeout: float = TIMEOUT) -> dict[str, Any]:
+def websocket_probe(target: dict[str, str] | str, path: str = "/ws",
+                    timeout: float = TIMEOUT) -> dict[str, Any]:
     """Offer a real handshake, since a POST is not what that route wants.
 
     HTTP 101 means the API is a socket and the whole integration changes
-    shape; anything else is still an answer worth reading.
+    shape; anything else is still an answer worth reading -- a redirect here
+    is how this box told us which name and scheme it answers on.
     """
-    host, _, port = ip.partition(":")
+    spot = where(target) if isinstance(target, str) else target
+    scheme, ip, host = spot["scheme"], spot["ip"], spot["host"] or spot["ip"]
+    name, _, port = ip.partition(":")
     handshake = "\r\n".join((
         f"GET {path} HTTP/1.1",
-        f"Host: {ip}",
+        f"Host: {host}",
         "Upgrade: websocket",
         "Connection: Upgrade",
         f"Sec-WebSocket-Key: {base64.b64encode(os.urandom(16)).decode()}",
         "Sec-WebSocket-Version: 13",
-        f"Origin: http://{ip}",
+        f"Origin: {scheme}://{host}",
         "", "",
     )).encode()
+    described = {"path": path, "origin": describe(spot)}
     try:
-        with socket.create_connection((host, int(port or 80)), timeout=timeout) as link:
+        link = socket.create_connection((name, int(port or (443 if scheme == "https" else 80))),
+                                        timeout=timeout)
+        if scheme == "https":
+            link = net.INSECURE_CONTEXT.wrap_socket(link, server_hostname=host)
+        with link:
             link.sendall(handshake)
             answer = link.recv(4096).decode("utf-8", "replace")
     except (OSError, ValueError) as error:
-        return {"path": path, "status": None, "why": str(error), "headers": []}
+        return {**described, "status": None, "why": str(error), "headers": []}
     head = answer.split("\r\n\r\n")[0].splitlines()
     first = head[0].split() if head else []
     status = int(first[1]) if len(first) > 1 and first[1].isdigit() else None
-    return {"path": path, "status": status, "why": "" if head else "closed without answering",
+    return {**described, "status": status,
+            "why": "" if head else "closed without answering",
             "headers": [line for line in head[:14] if line.strip()]}
+
+
+def sah_probe(target: dict[str, str], timeout: float = TIMEOUT) -> list[dict[str, Any]]:
+    """Speak the older boxes' dialect properly, in case this one still does."""
+    return [_named(_ask(target, "POST", path, payload, timeout, SAH_HEADERS), target)
+            for path, payload in SAH_CALLS]
+
+
+def _named(result: dict[str, Any], target: dict[str, str]) -> dict[str, Any]:
+    return {**result, "origin": describe(target), "json": isinstance(result.get("body"), dict),
+            "sample": _sample(result.get("body"))}
 
 
 def socket_paths(mentioned: list[str]) -> list[str]:
@@ -303,42 +473,51 @@ def socket_paths(mentioned: list[str]) -> list[str]:
     return list(dict.fromkeys(["/ws", *likely]))[:5]
 
 
-def read_assets(urls: list[str], timeout: float = TIMEOUT) -> list[dict[str, Any]]:
+def read_assets(target: dict[str, str], urls: list[str], timeout: float = TIMEOUT) -> list[dict[str, Any]]:
     if not urls:
         return []
     with ThreadPoolExecutor(max_workers=min(8, len(urls))) as pool:
-        return list(pool.map(lambda url: _try("", "GET", url, timeout=timeout), urls))
+        return list(pool.map(lambda url: _ask(target, "GET", url, timeout=timeout), urls))
 
 
 def survey(ip: str = DEFAULT_ADDRESS, timeout: float = TIMEOUT) -> dict[str, Any]:
     """Everything that can be learned without a password."""
-    root = _try(ip, "GET", "/", timeout=timeout)
+    pages = front_pages(ip, timeout)
+    spot = pick(pages)
+    root = next((item for item in pages if item["target"] is spot), pages[0])
     page = _text(root.get("body"))
-    title = (TITLE_PATTERN.search(page).group(1).strip() if TITLE_PATTERN.search(page) else "")
+    title = root.get("title") or _title(page)
 
     tried = [
         {**result, "json": isinstance(result.get("body"), dict),
          "names_itself": any(mark in _text(result.get("body")).lower() for mark in FINGERPRINTS),
          "sample": _sample(result.get("body"))}
-        for result in _in_parallel(ip, CANDIDATES, timeout)
+        for result in _in_parallel(spot, CANDIDATES, timeout)
     ]
 
     controls = [{**result, "sample": _sample(result.get("body"))}
-                for result in _in_parallel(ip, CONTROLS, timeout)]
+                for result in _in_parallel(spot, CONTROLS, timeout)]
 
     # The page's own scripts, then the scripts those load for themselves: a
     # bundler splits the app, and the split-off half is where the API often is.
-    assets = assets_of(ip, timeout)
-    fetched = read_assets(assets, timeout)
+    assets = assets_of(spot, page, timeout)
+    fetched = read_assets(spot, assets, timeout)
     bodies = [_text(item.get("body")) for item in fetched]
-    extra = chunks_in(ip, bodies, assets)
+    extra = chunks_in(spot, bodies, assets)
     if extra:
-        fetched += read_assets(extra, timeout)
+        fetched += read_assets(spot, extra, timeout)
         bodies = [_text(item.get("body")) for item in fetched]
 
     mentioned = endpoints_in(bodies)
     snippets = snippets_in(bodies)
-    sockets = [websocket_probe(ip, path, min(timeout, 3.0)) for path in socket_paths(mentioned)]
+    # Both ways round: the box may answer a socket only on the name and scheme
+    # it redirects to, which is not the one its front page answers on.
+    places = list(dict.fromkeys([describe(spot), *(describe(item["target"]) for item in pages)]))
+    lookup = {describe(item["target"]): item["target"] for item in pages}
+    sockets = [websocket_probe(lookup.get(place, spot), path, min(timeout, 3.0))
+               for path in socket_paths(mentioned) for place in places[:3]]
+    dialect = [item for place in places[:3]
+               for item in sah_probe(lookup.get(place, spot), timeout)]
 
     # Whatever the app names, ask for it: that is the point of reading the app.
     # A path already tried above is not asked for twice -- its answer is reused,
@@ -349,7 +528,7 @@ def survey(ip: str = DEFAULT_ADDRESS, timeout: float = TIMEOUT) -> dict[str, Any
     fresh = [("GET", path, None) for path in askable if path not in already][:70]
     asked = [
         {**result, "json": isinstance(result.get("body"), dict), "sample": _sample(result.get("body"))}
-        for result in _in_parallel(ip, fresh, timeout)
+        for result in _in_parallel(spot, fresh, timeout)
     ]
     by_path = {**{item["path"]: item for item in asked}, **already}
     discovered = [by_path[path] for path in askable if path in by_path]
@@ -358,10 +537,18 @@ def survey(ip: str = DEFAULT_ADDRESS, timeout: float = TIMEOUT) -> dict[str, Any
         "address": ip,
         "title": title,
         "reachable": root["reached"],
+        "spoken_to": describe(spot),
+        "origins": [{"origin": describe(item["target"]), "status": item["status"],
+                     "title": item["title"], "bytes": len(_text(item.get("body"))),
+                     "server": (item.get("headers") or {}).get("server", ""),
+                     "location": (item.get("headers") or {}).get("location", ""),
+                     "why": item.get("why", "")}
+                    for item in pages],
         "candidates": tried,
         "controls": controls,
         "assets": [{"url": item["path"], "status": item["status"], "bytes": len(_text(item.get("body")))}
                    for item in fetched],
+        "dialect": dialect,
         "mentioned": mentioned,
         "rebuilt": rebuilt,
         "snippets": snippets,
@@ -370,12 +557,12 @@ def survey(ip: str = DEFAULT_ADDRESS, timeout: float = TIMEOUT) -> dict[str, Any
     }
 
 
-def _in_parallel(ip: str, requests: Any, timeout: float) -> list[dict[str, Any]]:
+def _in_parallel(target: dict[str, str], requests: Any, timeout: float) -> list[dict[str, Any]]:
     requests = list(requests)
     if not requests:
         return []
     with ThreadPoolExecutor(max_workers=min(10, len(requests))) as pool:
-        return list(pool.map(lambda item: _try(ip, item[0], item[1], item[2], timeout), requests))
+        return list(pool.map(lambda item: _ask(target, item[0], item[1], item[2], timeout), requests))
 
 
 def _sample(body: Any) -> str:
@@ -395,17 +582,24 @@ def gateway_candidates() -> list[str]:
 
 
 def probe(ip: str = DEFAULT_ADDRESS, timeout: float = TIMEOUT) -> dict[str, Any] | None:
-    """Recognise the box from its own front page, without logging in."""
-    root = _try(ip, "GET", "/", timeout=timeout)
-    if not root["reached"]:
+    """Recognise the box from its own front page, without logging in.
+
+    Over whichever scheme and hostname it answers on: this box redirects to a
+    name of its own, and a bare-IP request gets a different server's opinion.
+    """
+    pages = front_pages(ip, timeout)
+    if not any(item["reached"] for item in pages):
         return None
+    spot = pick(pages)
+    root = next((item for item in pages if item["target"] is spot), pages[0])
     page = _text(root.get("body"))
-    title_match = TITLE_PATTERN.search(page)
-    title = title_match.group(1).strip() if title_match else ""
-    haystack = f"{title} {page[:4000]}".lower()
+    title = root.get("title") or ""
+    named = " ".join(hosts_in(pages))
+    haystack = f"{title} {named} {page[:4000]}".lower()
     if not any(mark in haystack for mark in FINGERPRINTS):
         return None
     return {
+        "origin": describe(spot),
         "id": f"swisscom-{ip.replace('.', '-').replace(':', '-')}",
         "source": SOURCE,
         "ip": ip,
@@ -520,6 +714,19 @@ def report(found: dict[str, Any]) -> str:
     lines.append(f"  front page: {'answered' if found['reachable'] else 'no answer'}"
                  + (f", titled {found['title']!r}" if found["title"] else ""))
 
+    lines += ["", "  where it answers (a box that redirects is naming the scheme",
+              "  and hostname its own UI uses; everything below is asked there):"]
+    for item in found.get("origins", []):
+        answer = f"HTTP {item['status']}" if item["status"] else f"no answer ({item['why'][:44]})"
+        marks = " ".join(filter(None, [
+            f"{item['bytes']}b" if item["bytes"] else "",
+            f"titled {item['title']!r}" if item["title"] else "",
+            f"server {item['server']}" if item["server"] else "",
+            f"→ {item['location']}" if item["location"] else "",
+        ]))
+        lines.append(f"    {item['origin']:<48} {answer} {marks}".rstrip())
+    lines.append(f"    chosen: {found.get('spoken_to', '')}")
+
     lines += ["", "  control (this path certainly does not exist — every other",
               "  answer means whatever differs from these two):"]
     for item in found.get("controls", []):
@@ -536,10 +743,19 @@ def report(found: dict[str, Any]) -> str:
     lines += ["", "  websocket handshake (a route that resets a POST but takes an",
               "  upgrade is the API, not a dead end):"]
     for item in found.get("sockets", []):
-        lines.append(f"    {item['path']:<24} "
-                     + (f"HTTP {item['status']}" if item["status"] else f"no answer ({item['why'][:60]})"))
+        lines.append(f"    {item['path']:<10} {item.get('origin', ''):<42} "
+                     + (f"HTTP {item['status']}" if item["status"] else f"no answer ({item['why'][:44]})"))
         for header in item["headers"][1:]:
             lines.append(f"          {header[:120]}")
+
+    lines += ["", "  the SoftAtHome dialect (the content type is part of the",
+              "  protocol, so a plain JSON POST proves nothing about /ws):"]
+    for item in found.get("dialect", []):
+        answer = f"HTTP {item['status']}" if item["reached"] else f"no answer ({item['why'][:44]})"
+        lines.append(f"    {item['path']:<10} {item.get('origin', ''):<42} {answer}"
+                     + (" JSON" if item.get("json") else ""))
+        if item.get("sample"):
+            lines.append(f"          {item['sample'][:200]}")
 
     lines += ["", f"  scripts read: {len(found['assets'])}"]
     for asset in found["assets"]:

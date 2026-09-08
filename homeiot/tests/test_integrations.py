@@ -391,10 +391,16 @@ class BoxHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
-        self.rfile.read(length)
-        if self.path == "/ws":  # a socket route has nothing to say to a POST
-            self.close_connection = True
-            return
+        sent = self.rfile.read(length)
+        if self.path == "/ws":
+            # The dialect is the content type: anything else gets dropped, which
+            # is exactly how a live route can look like a dead one.
+            if self.headers.get("Content-Type") != "application/x-sah-ws-4-call+json":
+                self.close_connection = True
+                return
+            asked = json.loads(sent or b"{}").get("method", "")
+            return self._send(200, json.dumps({"status": {"method": asked, "contextID": "abc123"}}),
+                              "application/json")
         self._send(404, "<html>404</html>", "text/html")
 
     def _upgrade(self):
@@ -485,6 +491,16 @@ class InternetBoxProbeTests(unittest.TestCase):
         sockets = {item["path"]: item for item in self.found["sockets"]}
         self.assertEqual(sockets["/ws"]["status"], 101)
         self.assertTrue(any("websocket" in header.lower() for header in sockets["/ws"]["headers"]))
+
+    def test_it_speaks_the_dialect_before_calling_a_route_dead(self):
+        """The same POST fails or succeeds on its content type alone."""
+        spoke = [item for item in self.found["dialect"] if item["path"] == "/ws" and item["json"]]
+        self.assertTrue(spoke, self.found["dialect"])
+        self.assertIn("contextID", spoke[0]["sample"])
+        # And the plain-JSON POST in the known paths got nothing, from the
+        # very same route: that difference is the whole point of the probe.
+        plain = {item["path"]: item for item in self.found["candidates"]}["/ws"]
+        self.assertFalse(plain["reached"])
 
     def test_the_control_says_what_a_missing_path_looks_like(self):
         """Without this, a 404 could mean anything."""
