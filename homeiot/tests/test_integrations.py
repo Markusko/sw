@@ -560,10 +560,17 @@ class SwisscomTests(unittest.TestCase):
 
 SYSBUS_PASSWORD = "letmein123"
 SYSBUS_CONTEXT = "ctx-abc123"
-SYSBUS_COOKIE = "deviceid/sessid=cookie-xyz"
+# Two of them, as the real box sets: its own core.min.js says the login "is
+# stored in two cookies", and a client that keeps one is refused like a
+# client with no password at all.
+SYSBUS_COOKIES = ("deviceid/sessid=cookie-xyz", "sah/context=ctx-cookie")
+SYSBUS_COOKIE = "; ".join(SYSBUS_COOKIES)
 
 
 class SysbusHandler(BaseHTTPRequestHandler):
+    logins = 0             # how many times a client logged in
+    context = SYSBUS_CONTEXT  # what the box currently accepts; rotate to expire
+
     def log_message(self, *_args):
         pass
 
@@ -571,16 +578,18 @@ class SysbusHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         sent = json.loads(self.rfile.read(length) or b"{}")
         sah = self.headers.get("Content-Type") == "application/x-sah-ws-4-call+json"
-        authed = (sah and self.headers.get("X-Context") == SYSBUS_CONTEXT
-                  and self.headers.get("Authorization") == f"X-Sah {SYSBUS_CONTEXT}"
+        current = SysbusHandler.context
+        authed = (sah and self.headers.get("X-Context") == current
+                  and self.headers.get("Authorization") == f"X-Sah {current}"
                   and self.headers.get("Cookie") == SYSBUS_COOKIE)
 
         if self.path == "/ws" and sah and self.headers.get("Authorization") == "X-Sah-Login":
             parameters = sent.get("parameters", {})
             if (sent.get("service") == "sah.Device.Information" and sent.get("method") == "createContext"
                     and parameters.get("password") == SYSBUS_PASSWORD):
-                return self._json(200, {"status": 0, "data": {"contextID": SYSBUS_CONTEXT}},
-                                  set_cookie=f"{SYSBUS_COOKIE}; path=/; HttpOnly")
+                SysbusHandler.logins += 1
+                return self._json(200, {"status": 0, "data": {"contextID": current}},
+                                  cookies=SYSBUS_COOKIES)
             return self._json(401, {"status": 1, "data": {}})
 
         if self.path == "/ws" and sah and sent.get("service") == "Devices" and sent.get("method") == "get":
@@ -604,13 +613,13 @@ class SysbusHandler(BaseHTTPRequestHandler):
         # fake's 404 makes clear a caller using that shape gets nothing.
         self._json(404, {"error": "not found"})
 
-    def _json(self, status, payload, set_cookie=None):
+    def _json(self, status, payload, cookies=()):
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/x-sah-ws-4-call+json")
         self.send_header("Content-Length", str(len(body)))
-        if set_cookie:
-            self.send_header("Set-Cookie", set_cookie)
+        for cookie in cookies:
+            self.send_header("Set-Cookie", f"{cookie}; path=/; HttpOnly")
         self.end_headers()
         self.wfile.write(body)
 
@@ -635,6 +644,39 @@ class SwisscomSysbusTests(unittest.TestCase):
         swisscom._origin = cls.original_origin
         cls.server.shutdown()
         cls.server.server_close()
+
+    def setUp(self):
+        # Sessions outlive a single read by design, so each test starts from
+        # a box nobody has logged into yet.
+        swisscom._SESSIONS.clear()
+        SysbusHandler.logins = 0
+        SysbusHandler.context = SYSBUS_CONTEXT
+
+    def test_both_cookies_go_back_not_just_the_last_one(self):
+        """The fake box refuses a client that kept only one of them."""
+        session = swisscom._login(self.address, SYSBUS_PASSWORD)
+        self.assertEqual(session["cookie"], SYSBUS_COOKIE)
+        self.assertIn("; ", session["cookie"])
+
+    def test_the_session_is_kept_rather_than_remade_every_poll(self):
+        """The dashboard polls every four seconds; that is not a login rate."""
+        for _ in range(3):
+            swisscom.snapshot({"ip": self.address, "password": SYSBUS_PASSWORD})
+        self.assertEqual(SysbusHandler.logins, 1)
+
+    def test_a_session_the_box_forgot_is_replaced_once(self):
+        """A refused session and a wrong password look the same; only one is."""
+        first = swisscom.snapshot({"ip": self.address, "password": SYSBUS_PASSWORD})
+        self.assertEqual(first["detail"]["device_count"], 2)
+        SysbusHandler.context = "ctx-rotated"  # as a reboot or a timeout would
+        second = swisscom.snapshot({"ip": self.address, "password": SYSBUS_PASSWORD})
+        self.assertEqual(second["detail"]["device_count"], 2)
+        self.assertEqual(SysbusHandler.logins, 2)
+
+    def test_a_changed_password_does_not_ride_the_old_session(self):
+        swisscom.snapshot({"ip": self.address, "password": SYSBUS_PASSWORD})
+        raw = swisscom.snapshot({"ip": self.address, "password": "nope"})
+        self.assertEqual(raw["detail"], {"error": "the box did not accept that password"})
 
     def test_public_status_needs_no_password(self):
         raw = swisscom.snapshot({"ip": self.address, "password": ""})

@@ -14,6 +14,7 @@ import socket
 import ssl
 import urllib.error
 import urllib.request
+from email.message import Message as EmailMessage
 from typing import Any, Mapping
 
 TIMEOUT = 6.0
@@ -59,12 +60,18 @@ def request_with_headers(
     timeout: float = TIMEOUT,
     insecure: bool = False,
     raw_body: bytes | None = None,
-) -> tuple[int, Any, Mapping[str, str]]:
+) -> tuple[int, Any, EmailMessage]:
     """Like `request`, but also hands back the response headers.
 
     A cookie-based session (Swisscom's Internet-Box, for one) is set with a
     `Set-Cookie` a JSON body never carries, so reading it needs the headers
     `request` otherwise throws away.
+
+    The headers come back as the response's own container rather than a dict:
+    a dict keeps one value per name, and a login that sets two cookies -- the
+    Internet-Box does -- would lose one of them silently, leaving a session
+    that fails exactly like a wrong password.  `get` still reads a header
+    case-insensitively; `get_all` reads every value of a repeated one.
     """
     body = raw_body if raw_body is not None else (None if payload is None else json.dumps(payload).encode())
     all_headers = {"Accept": "application/json", **(headers or {})}
@@ -74,7 +81,7 @@ def request_with_headers(
     context = INSECURE_CONTEXT if insecure and url.startswith("https") else None
     try:
         with urllib.request.urlopen(plea, timeout=timeout, context=context) as response:
-            return response.status, _decode(response.read()), {k.lower(): v for k, v in response.getheaders()}
+            return response.status, _decode(response.read()), response.headers
     except urllib.error.HTTPError as error:  # the bridge explains itself in the body
         raise HttpError(f"{method} {url} -> HTTP {error.code}", error.code, _decode(error.read()))
     except (urllib.error.URLError, socket.timeout, OSError) as error:

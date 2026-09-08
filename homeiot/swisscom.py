@@ -62,6 +62,7 @@ import json
 import os
 import re
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -110,12 +111,23 @@ FINGERPRINTS = ("internet-box", "internetbox", "swisscom", "arcadyan")
 # refused by it; the content type is part of the protocol, not decoration, so
 # the earlier probes could not have told a wrong dialect from a missing route.
 SAH_HEADERS = {"Content-Type": "application/x-sah-ws-4-call+json", "Authorization": "X-Sah-Login"}
+
 SAH_CALLS: tuple[tuple[str, Any], ...] = (
     ("/ws", {"service": "sah.Device.Information", "method": "createContext",
              "parameters": {"applicationName": "webui", "username": "guest", "password": "guest"}}),
     ("/ws", {"service": "DeviceInfo", "method": "get", "parameters": {}}),
     ("/ws/NeMo/Intf/data", {"service": "NeMo.Intf.data", "method": "getMIBs", "parameters": {}}),
 )
+
+# What the box's own webui asks for: everything on the LAN that is not the box
+# itself and not one of its own interfaces.
+DEVICE_QUERY = {"expression": "lan and not self and not interface", "flags": "no_actions"}
+
+# Sessions live here rather than being rebuilt inside every poll.  Keyed by
+# address and password; nothing is written to disk, and nothing here is ever
+# rendered into a snapshot, an error or a log.
+_SESSIONS: dict[tuple[str, str], dict[str, str]] = {}
+_SESSION_LOCK = threading.Lock()
 
 # Every quoted string in a bundle, then judged rather than matched: a build
 # tool joins a base onto a relative path, so requiring a leading `/api` finds
@@ -723,8 +735,51 @@ def _login(ip: str, password: str, timeout: float = TIMEOUT) -> dict[str, str]:
     context = (body.get("data") or {}).get("contextID", "")
     if not context:
         return {}
-    cookie = (response_headers.get("set-cookie") or "").split(";", 1)[0]
+    cookie = _cookies(response_headers)
     return {"context": context, "cookie": cookie} if cookie else {"context": context}
+
+
+def _cookies(response_headers: Any) -> str:
+    """Every cookie the login set, joined the way a browser sends them back.
+
+    ``core.min.js`` says the login "is stored in two cookies", and the box
+    sets them as two separate ``Set-Cookie`` headers.  Keeping only one --
+    which any name-to-value mapping of the headers does, silently -- leaves a
+    session that is refused exactly like a wrong password.
+    """
+    if hasattr(response_headers, "get_all"):
+        given = response_headers.get_all("set-cookie") or []
+    else:  # a plain mapping: one value per name is all there is to read
+        one = (response_headers or {}).get("set-cookie")
+        given = [one] if one else []
+    pairs = [str(item).split(";", 1)[0].strip() for item in given]
+    return "; ".join(pair for pair in pairs if "=" in pair)
+
+
+def _session(ip: str, password: str, timeout: float = TIMEOUT,
+             renew: bool = False) -> dict[str, str]:
+    """A logged-in session, kept rather than re-established every four seconds.
+
+    The dashboard polls this box on the plain interval, so logging in inside
+    each snapshot means a login every few seconds for as long as the page is
+    open -- pointless load, and the kind of thing a router is entitled to
+    start refusing.  The session is held until the box refuses it, and keyed
+    by password so that changing the stored one cannot leave the old session
+    answering for it.
+    """
+    key = (ip, password)
+    if not renew:
+        with _SESSION_LOCK:
+            kept = _SESSIONS.get(key)
+        if kept:
+            return kept
+    made = _login(ip, password, timeout)
+    with _SESSION_LOCK:
+        if made:
+            _SESSIONS[key] = made
+        else:
+            _SESSIONS.pop(key, None)
+    return made
 
 
 def snapshot(device: dict[str, Any]) -> dict[str, Any]:
@@ -760,12 +815,18 @@ def _read_with_password(device: dict[str, Any]) -> dict[str, Any]:
     Read as a count rather than parsed field by field, since the per-device
     shape (name, IP, MAC, ...) was seen but is not yet relied on by anything.
     """
-    session = _login(device["ip"], device["password"])
+    ip, password = device["ip"], device["password"]
+    session = _session(ip, password)
     if not session:
         return {"error": "the box did not accept that password"}
-    devices = _rpc(device["ip"], "Devices", "get",
-                   {"expression": "lan and not self and not interface", "flags": "no_actions"},
-                   session=session)
+    devices = _rpc(ip, "Devices", "get", DEVICE_QUERY, session=session)
+    if devices is None:
+        # A session the box has forgotten is refused exactly as a bad one is,
+        # so the only way to tell them apart is to log in again and re-ask.
+        session = _session(ip, password, renew=True)
+        if not session:
+            return {"error": "the box did not accept that password"}
+        devices = _rpc(ip, "Devices", "get", DEVICE_QUERY, session=session)
     detail: dict[str, Any] = {"authenticated": True}
     if isinstance(devices, (dict, list)):
         detail["device_count"] = len(devices)
