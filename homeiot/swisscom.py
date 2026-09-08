@@ -1022,8 +1022,9 @@ def wan_report(ip: str, password: str, timeout: float = TIMEOUT) -> str:
     optical = _pick(mibs, "gpon") if isinstance(mibs, dict) else None
 
     lines = [f"WAN probe — {ip}", "",
-             f"  traffic log: {len(entries or [])} entries, {len(samples)} of them readable"]
-    for entry in (entries or [])[:2]:
+             f"  traffic log: {len(entries or [])} entries, {len(samples)} of them readable",
+             "  (the last two, which are the pair the speed below is measured from)"]
+    for entry in (entries or [])[-2:]:
         lines.append(f"    {json.dumps(entry)[:300]}")
     if entries and not samples:
         lines.append("    ^ none of these carried a time and both counters under the names"
