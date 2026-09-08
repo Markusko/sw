@@ -12,7 +12,7 @@ import threading
 import time
 from typing import Any, Callable
 
-from . import demo, discovery, hue, model, store
+from . import camera, demo, discovery, hue, model, shelly, store
 
 POLL_STREAMING = 60.0  # the event stream carries changes; this is a safety net
 POLL_PLAIN = 4.0  # bridges without a stream (v1) and the simulator
@@ -37,7 +37,10 @@ def create(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def transport(bridge: dict[str, Any]):
-    return demo if bridge.get("api") == "demo" else hue
+    """Which integration speaks for this gateway or device."""
+    if bridge.get("api") == "demo":
+        return demo
+    return shelly if bridge.get("source") == shelly.SOURCE else hue
 
 
 def bridges(hub: dict[str, Any]) -> list[dict[str, Any]]:
@@ -51,10 +54,16 @@ def find_bridge(hub: dict[str, Any], bridge_id: str) -> dict[str, Any] | None:
 # --- snapshot ----------------------------------------------------------------
 
 
+def build_home(bridge: dict[str, Any], raw: Any) -> dict[str, Any]:
+    """Each integration normalises its own data into the one shared shape."""
+    builder = getattr(transport(bridge), "home", None)
+    return builder(bridge, raw) if builder else model.build_home(bridge, raw)
+
+
 def rebuild(hub: dict[str, Any]) -> dict[str, Any]:
     with hub["lock"]:
         homes = [
-            model.build_home(bridge, hub["raw"][bridge["id"]])
+            build_home(bridge, hub["raw"][bridge["id"]])
             for bridge in bridges(hub)
             if bridge["id"] in hub["raw"]
         ]
@@ -69,6 +78,9 @@ def snapshot(hub: dict[str, Any]) -> dict[str, Any]:
         config = hub["config"]
         collections = model.decorate_collections(config.get("collections", []), home)
         return {
+            "readouts": resolve_readouts(config.get("readouts", []), home),
+            "cameras": [camera.describe(item) for item in config.get("cameras", [])],
+            "ffmpeg": camera.have_ffmpeg(),
             "revision": hub["revision"],
             "generated_at": time.time(),
             "bridges": [
@@ -77,6 +89,7 @@ def snapshot(hub: dict[str, Any]) -> dict[str, Any]:
                     "name": bridge.get("name", "Hue Bridge"),
                     "ip": bridge.get("ip", ""),
                     "api": bridge.get("api", "v2"),
+                    "source": bridge.get("source", "hue"),
                     "model": bridge.get("model", ""),
                     "demo": bool(bridge.get("demo")),
                     **hub["status"].get(bridge["id"], {}),
@@ -90,6 +103,32 @@ def snapshot(hub: dict[str, Any]) -> dict[str, Any]:
             "network": hub["network"],
             "ui": config.get("ui", {}),
         }
+
+
+def resolve_readouts(readouts: list[dict[str, Any]], home: dict[str, Any]) -> list[dict[str, Any]]:
+    """Attach the live value to each pinned readout."""
+    devices = {device["id"]: device for device in home["devices"]}
+    resolved = []
+    for readout in readouts:
+        device = devices.get(readout["device"])
+        reading = next(
+            (item for item in (device or {}).get("readings", []) if item["kind"] == readout["kind"]), None
+        )
+        resolved.append(
+            {
+                **readout,
+                "device_name": device["name"] if device else None,
+                "display": reading["display"] if reading else "—",
+                "value": reading["value"] if reading else None,
+                "unit": (reading or {}).get("unit", ""),
+                "missing": device is None or reading is None,
+            }
+        )
+    return resolved
+
+
+def find_camera(hub: dict[str, Any], camera_id: str) -> dict[str, Any] | None:
+    return next((item for item in hub["config"].get("cameras", []) if item["id"] == camera_id), None)
 
 
 # --- fan-out -----------------------------------------------------------------
@@ -290,7 +329,12 @@ def command(hub: dict[str, Any], target_id: str, body: dict[str, Any]) -> dict[s
         try:
             transport(bridge).send(bridge, write["rtype"], write["rid"], payload)
             results.append({**write, "payload": payload})
-            events.append({"bridge": bridge["id"], "data": {**payload, "id": write["rid"], "type": write["rtype"]}})
+            # Only Hue keeps CLIP v2 resources, so only Hue can be patched
+            # ahead of the bridge confirming.  The rest are re-read instead.
+            if bridge.get("source", "hue") == "hue":
+                events.append(
+                    {"bridge": bridge["id"], "data": {**payload, "id": write["rid"], "type": write["rtype"]}}
+                )
         except Exception as error:
             failures.append(str(error))
 
@@ -372,10 +416,14 @@ def _schedule_refresh(hub: dict[str, Any], bridge: dict[str, Any], delay: float 
 # --- discovery ---------------------------------------------------------------
 
 
-def discover(hub: dict[str, Any], deep: bool = False) -> list[dict[str, Any]]:
+def discover(hub: dict[str, Any], source: str = "hue", deep: bool = False) -> list[dict[str, Any]]:
     known = {bridge["id"] for bridge in bridges(hub)}
-    found = discovery.discover_hue(deep=deep)
-    return [{**bridge, "paired": bridge["id"] in known} for bridge in found]
+    found = (
+        shelly.discover(deep=deep)
+        if source == shelly.SOURCE
+        else [{**item, "source": "hue"} for item in discovery.discover_hue(deep=deep)]
+    )
+    return [{**item, "paired": item["id"] in known} for item in found]
 
 
 def scan_network(hub: dict[str, Any]) -> dict[str, Any]:

@@ -27,12 +27,16 @@
 
     <main class="container-fluid py-3" id="main"></main>
 
-    <div class="offcanvas offcanvas-end" tabindex="-1" id="panel" aria-labelledby="panel-title">
-      <div class="offcanvas-header border-bottom">
-        <h2 class="offcanvas-title h5 mb-0" id="panel-title">Details</h2>
-        <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+    <div class="modal fade" tabindex="-1" id="panel" aria-labelledby="panel-title" aria-hidden="true">
+      <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h2 class="modal-title h5 mb-0" id="panel-title">Details</h2>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body" id="panel-body"></div>
+        </div>
       </div>
-      <div class="offcanvas-body" id="panel-body"></div>
     </div>
 
     <div class="toast-container position-fixed bottom-0 start-50 translate-middle-x p-3" id="toasts"></div>

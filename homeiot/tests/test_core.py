@@ -16,7 +16,7 @@ import time
 import unittest
 from pathlib import Path
 
-from homeiot import color, demo, discovery, hue, hub as hub_module, model, server, store
+from homeiot import camera, color, demo, discovery, hue, hub as hub_module, model, server, shelly, store
 
 
 class ColorTests(unittest.TestCase):
@@ -276,6 +276,154 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_txt_records(self):
         self.assertEqual(discovery._parse_txt(b"\x07key=val"), {"key": "val"})
+
+
+class ShellyTests(unittest.TestCase):
+    GEN2 = {
+        "status": {
+            "switch:0": {"id": 0, "output": True, "apower": 842.5, "voltage": 231.4,
+                         "aenergy": {"total": 128340.0}},
+            "temperature:0": {"tC": 21.9},
+            "humidity:0": {"rh": 46.0},
+            "devicepower:0": {"battery": {"V": 2.9, "percent": 74}},
+        }
+    }
+    GEN1 = {
+        "status": {
+            "relays": [{"ison": True}, {"ison": False}],
+            "meters": [{"power": 12.5, "total": 60000}, {"power": 0.0, "total": 0}],
+            "tmp": {"value": 71.6, "units": "F", "is_valid": True},
+            "hum": {"value": 55.0, "is_valid": True},
+            "bat": {"value": 88},
+            "wifi_sta": {"connected": True},
+        },
+        "settings": {"name": "Old relay"},
+    }
+
+    def test_gen2_becomes_one_controllable_device(self):
+        device = {"id": "shellyplus1pm-a1", "name": "Boiler", "model": "SNSW-001P16EU", "generation": 2}
+        built = shelly.home(device, self.GEN2)["devices"]
+        self.assertEqual(len(built), 1)
+        entry = built[0]
+        self.assertEqual(entry["id"], "shelly:shellyplus1pm-a1:switch:0")
+        self.assertEqual(entry["kind"], "relay")
+        self.assertEqual(entry["capabilities"], ["on_off"])
+        self.assertTrue(entry["state"]["on"])
+        self.assertEqual(entry["battery"]["level"], 74)
+        readings = {reading["kind"]: reading["display"] for reading in entry["readings"]}
+        self.assertEqual(readings["power"], "842.5 W")
+        self.assertEqual(readings["energy"], "128.34 kWh")
+        self.assertEqual(readings["temperature"], "21.9 °C")
+        self.assertEqual(readings["humidity"], "46 %")
+
+    def test_gen1_multi_channel_and_fahrenheit(self):
+        device = {"id": "shsw-25-b2", "name": "", "model": "SHSW-25", "generation": 1}
+        built = shelly.home(device, self.GEN1)["devices"]
+        self.assertEqual([entry["name"] for entry in built], ["Old relay 1", "Old relay 2"])
+        self.assertTrue(built[0]["state"]["on"])
+        self.assertFalse(built[1]["state"]["on"])
+        # Sensors belong to the device, so they are listed once, on channel one.
+        kinds = {reading["kind"] for reading in built[0]["readings"]}
+        self.assertTrue({"power", "energy", "temperature", "humidity"} <= kinds)
+        self.assertEqual({reading["kind"] for reading in built[1]["readings"]}, {"power", "energy"})
+        temperature = next(r for r in built[0]["readings"] if r["kind"] == "temperature")
+        self.assertEqual(temperature["display"], "22 °C")  # 71.6F
+        self.assertEqual(built[0]["battery"]["level"], 88)
+
+    def test_a_device_with_only_sensors_is_not_controllable(self):
+        device = {"id": "shellyht-c3", "name": "Cellar", "model": "SHHT-1", "generation": 1}
+        built = shelly.home(device, {"status": {"tmp": {"value": 8.5}, "hum": {"value": 80.0}}})["devices"]
+        self.assertEqual(len(built), 1)
+        self.assertEqual(built[0]["kind"], "sensor")
+        self.assertFalse(built[0]["controllable"])
+
+    def test_ids_route_writes_back_to_the_channel(self):
+        device = {"id": "shellyplus1pm-a1", "name": "Boiler", "model": "X", "generation": 2}
+        home = shelly.home(device, self.GEN2)
+        writes = model.write_targets(home, [], home["devices"][0]["id"])
+        self.assertEqual(writes, [{"bridge": "shellyplus1pm-a1", "rtype": "switch", "rid": "0"}])
+
+    def test_probe_reads_both_generations(self):
+        self.assertEqual(model.parse_id("shelly:abc:switch:0"),
+                         {"source": "shelly", "bridge": "abc", "rtype": "switch", "rid": "0"})
+
+
+class ReadoutTests(unittest.TestCase):
+    HOME = {
+        "devices": [
+            {"id": "shelly:x:switch:0", "name": "Boiler", "readings": [
+                {"kind": "temperature", "display": "21.9 °C", "value": 21.9, "unit": "°C"},
+                {"kind": "power", "display": "842.5 W", "value": 842.5, "unit": "W"},
+            ]}
+        ],
+        "groups": [],
+    }
+
+    def test_a_readout_picks_up_its_live_value(self):
+        readout = store.normalise_readout(
+            {"label": "Energy usage", "device": "shelly:x:switch:0", "kind": "power", "room": "hue:b:room:1"}
+        )
+        resolved = hub_module.resolve_readouts([readout], self.HOME)[0]
+        self.assertEqual(resolved["display"], "842.5 W")
+        self.assertEqual(resolved["room"], "hue:b:room:1")
+        self.assertFalse(resolved["missing"])
+
+    def test_a_readout_for_a_vanished_device_says_so(self):
+        readout = store.normalise_readout({"label": "Gone", "device": "shelly:zz:switch:0", "kind": "power"})
+        resolved = hub_module.resolve_readouts([readout], self.HOME)[0]
+        self.assertTrue(resolved["missing"])
+        self.assertEqual(resolved["display"], "—")
+
+    def test_the_label_defaults_to_the_value_name(self):
+        self.assertEqual(
+            store.normalise_readout({"device": "d", "kind": "light_level"})["label"], "Light Level"
+        )
+
+    def test_a_readout_needs_something_to_read(self):
+        with self.assertRaises(ValueError):
+            store.normalise_readout({"label": "Nothing"})
+
+    def test_removing_a_device_removes_its_readouts(self):
+        config = store.load(Path("/nonexistent"))
+        config = store.put_readout(config, store.normalise_readout({"device": "shelly:x:switch:0", "kind": "power"}))
+        pruned = store.forget_devices(config, {"shelly:x:switch:0"})
+        self.assertEqual(pruned["readouts"], [])
+
+
+class CameraTests(unittest.TestCase):
+    def test_credentials_are_masked_not_leaked(self):
+        masked = camera.mask_url("rtsp://admin:hunter2@10.0.0.9:554/h264")
+        self.assertEqual(masked, "rtsp://admin:***@10.0.0.9:554/h264")
+        self.assertNotIn("hunter2", masked)
+        described = camera.describe({"id": "c1", "name": "Door", "rtsp_url": "rtsp://u:p@h/s"})
+        self.assertNotIn("p@h", described["url"])
+
+    def test_redaction_covers_error_text(self):
+        self.assertNotIn("hunter2", camera.redact("failed: rtsp://admin:hunter2@10.0.0.9/h264 timed out"))
+
+    def test_the_mode_says_what_can_actually_be_shown(self):
+        self.assertEqual(camera.mode({"demo": True}), "demo")
+        self.assertEqual(camera.mode({"snapshot_url": "http://h/s.jpg"}), "snapshot")
+        self.assertEqual(camera.mode({}), "unconfigured")
+        # Without ffmpeg an RTSP camera reports why, rather than showing nothing.
+        expected = "stream" if camera.have_ffmpeg() else "needs_ffmpeg"
+        self.assertEqual(camera.mode({"rtsp_url": "rtsp://h/s"}), expected)
+
+    def test_only_real_stream_addresses_are_accepted(self):
+        for bad in ("javascript:alert(1)", "file:///etc/passwd", "ftp://h/s"):
+            with self.assertRaises(ValueError):
+                camera.normalise({"id": "c1", "name": "X", "rtsp_url": bad})
+        ok = camera.normalise({"id": "c1", "name": "X", "rtsp_url": "rtsp://h/s", "room": "hue:b:room:1"})
+        self.assertEqual(ok["room"], "hue:b:room:1")
+
+    def test_a_camera_needs_an_id(self):
+        with self.assertRaises(ValueError):
+            camera.normalise({"name": "X"})
+
+    def test_the_demo_frame_is_a_real_png(self):
+        frame = camera.demo_frame(32, 18)
+        self.assertEqual(frame[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertIn(b"IEND", frame)
 
 
 class ServerTests(unittest.TestCase):

@@ -6,12 +6,48 @@ payloads, and drifts its sensors over time.  Start the server with `--demo`.
 
 from __future__ import annotations
 
+import json
 import random
 import threading
 import time
 from typing import Any
 
 from . import color
+
+# A simulated Shelly, so the second integration, the pinned values and the
+# camera can all be seen working without any hardware.
+SHELLY = {
+    "id": "demoshelly1pm",
+    "source": "shelly",
+    "api": "demo",
+    "shelly": True,
+    "ip": "0.0.0.0",
+    "name": "Boiler relay",
+    "model": "SNSW-001P16EU",
+    "generation": 2,
+    "firmware": "1.4.4",
+    "mac": "b0a7327d0e14",
+    "protected": False,
+    "demo": True,
+}
+
+CAMERA = {
+    "id": "cam-demo",
+    "name": "Front door camera",
+    "room": "hue:demo0000bridge:room:room-hallway",
+    "rtsp_url": "",
+    "snapshot_url": "",
+    "demo": True,
+}
+
+READOUTS = [
+    {"id": "val-demo-temp", "label": "Temperature", "device": "shelly:demoshelly1pm:switch:0",
+     "kind": "temperature", "room": "hue:demo0000bridge:room:room-living", "order": 0},
+    {"id": "val-demo-hum", "label": "Humidity", "device": "shelly:demoshelly1pm:switch:0",
+     "kind": "humidity", "room": "hue:demo0000bridge:room:room-living", "order": 1},
+    {"id": "val-demo-power", "label": "Energy usage", "device": "shelly:demoshelly1pm:switch:0",
+     "kind": "power", "room": "hue:demo0000bridge:room:room-living", "order": 2},
+]
 
 BRIDGE = {
     "id": "demo0000bridge",
@@ -63,6 +99,14 @@ SCENES = [
 _LOCK = threading.RLock()
 _STATE: dict[str, list[dict[str, Any]]] = {}
 _LAST_TICK = [0.0]
+
+_SHELLY_STATE: dict[str, Any] = {
+    "switch:0": {"id": 0, "output": True, "apower": 842.5, "voltage": 231.4,
+                 "current": 3.64, "aenergy": {"total": 128340.0}},
+    "temperature:0": {"id": 0, "tC": 21.9},
+    "humidity:0": {"id": 0, "rh": 46.0},
+    "sys": {"mac": "B0A7327D0E14", "uptime": 90210},
+}
 
 
 # --- construction ------------------------------------------------------------
@@ -326,18 +370,50 @@ def _xy(swatch: str) -> dict[str, float]:
 # --- transport-shaped API ----------------------------------------------------
 
 
-def snapshot(_bridge: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+def snapshot(bridge: dict[str, Any]) -> dict[str, Any]:
     with _LOCK:
+        if bridge.get("shelly"):
+            _tick_shelly()
+            return {"status": json.loads(json.dumps(_SHELLY_STATE))}
         if not _STATE:
             _STATE.update(build_state())
         _tick()
         return {rtype: [dict(item) for item in items] for rtype, items in _STATE.items()}
 
 
+def home(bridge: dict[str, Any], raw: Any) -> dict[str, Any]:
+    from . import model, shelly
+
+    return shelly.home(bridge, raw) if bridge.get("shelly") else model.build_home(bridge, raw)
+
+
+def _tick_shelly() -> None:
+    """Drift the readings so pinned values visibly move."""
+    switch = _SHELLY_STATE["switch:0"]
+    if switch["output"]:
+        switch["apower"] = round(color.clamp(switch["apower"] + random.uniform(-40, 40), 0, 2400), 1)
+        switch["aenergy"]["total"] = round(switch["aenergy"]["total"] + switch["apower"] / 3600, 1)
+    else:
+        switch["apower"] = 0.0
+    switch["voltage"] = round(color.clamp(switch["voltage"] + random.uniform(-0.6, 0.6), 220, 240), 1)
+    temperature = _SHELLY_STATE["temperature:0"]
+    temperature["tC"] = round(color.clamp(temperature["tC"] + random.uniform(-0.15, 0.15), 17, 26), 1)
+    humidity = _SHELLY_STATE["humidity:0"]
+    humidity["rh"] = round(color.clamp(humidity["rh"] + random.uniform(-0.5, 0.5), 30, 70), 1)
+
+
 def send(_bridge: dict[str, Any], rtype: str, rid: str, payload: dict[str, Any]) -> Any:
     from . import model  # local import keeps the module dependency-free at import time
 
     with _LOCK:
+        if _bridge.get("shelly"):
+            switch = _SHELLY_STATE.get(f"{rtype}:{rid}")
+            if switch is None:
+                raise KeyError(f"unknown channel {rtype}:{rid}")
+            if "on" in payload:
+                switch["output"] = bool(payload["on"]["on"])
+                switch["apower"] = 842.5 if switch["output"] else 0.0
+            return {"was_on": not switch["output"]}
         if not _STATE:
             _STATE.update(build_state())
         if rtype == "grouped_light":

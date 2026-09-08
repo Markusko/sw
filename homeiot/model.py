@@ -31,13 +31,14 @@ PLUG_ARCHETYPES = {"plug", "hue_lightstrip_plug"}
 # --- ids ---------------------------------------------------------------------
 
 
-def make_id(bridge_id: str, rtype: str, rid: str) -> str:
-    return f"hue:{bridge_id}:{rtype}:{rid}"
+def make_id(bridge_id: str, rtype: str, rid: str, source: str = "hue") -> str:
+    """An id names one addressable thing: source, gateway, kind, and which one."""
+    return f"{source}:{bridge_id}:{rtype}:{rid}"
 
 
 def parse_id(target_id: str) -> dict[str, str] | None:
     parts = str(target_id).split(":", 3)
-    if len(parts) != 4 or parts[0] != "hue":
+    if len(parts) != 4:
         return None
     return {"source": parts[0], "bridge": parts[1], "rtype": parts[2], "rid": parts[3]}
 
@@ -523,6 +524,9 @@ def write_targets(home: dict[str, Any], collections: list[dict[str, Any]], targe
     parsed = parse_id(target_id)
     if not parsed:
         return []
+    if parsed["source"] != "hue":
+        # Other integrations address the thing itself; there is no service layer.
+        return [{"bridge": parsed["bridge"], "rtype": parsed["rtype"], "rid": parsed["rid"]}]
     if parsed["rtype"] in ("room", "zone"):
         group = next((item for item in home["groups"] if item["id"] == target_id), None)
         if group and group["grouped_light"]:

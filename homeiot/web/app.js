@@ -14,8 +14,9 @@ const App = {
   snapshot: null,
   view: localStorage.getItem('view') || 'rooms',
   theme: localStorage.getItem('theme') || 'auto',
-  panel: null, // {kind: 'detail' | 'edit', id}
-  discovered: null,
+  panel: null, // {kind: 'detail' | 'edit' | 'camera', id}
+  discovered: null, // bridges offered during onboarding
+  found: null, // whatever the last search in Settings turned up
   searching: false,
 };
 
@@ -190,7 +191,23 @@ function deviceCard(device) {
   );
 }
 
-function groupCard(group, scenes) {
+const readoutStrip = (readouts) =>
+  !readouts.length
+    ? ''
+    : `<div class="d-flex flex-wrap column-gap-3 row-gap-1 small readout">${readouts
+        .map(
+          (readout) => `<span><span class="text-secondary">${esc(readout.label)}</span>
+            <span class="value fw-semibold">${esc(readout.display)}</span></span>`
+        )
+        .join('')}</div>`;
+
+// The still refreshes on a ten-second grid: the src only changes when the
+// bucket does, so the picture is never reloaded mid-render.
+const cameraStill = (camera, classes = 'camera-thumb rounded') =>
+  `<img class="${classes}" alt="${esc(camera.name)}" loading="lazy"
+    src="/api/cameras/${encodeURIComponent(camera.id)}/frame?t=${Math.floor(Date.now() / 10000)}" />`;
+
+function groupCard(group, scenes, readouts = [], cameras = []) {
   const state = group.state || {};
   return tile(
     group.id,
@@ -204,6 +221,8 @@ function groupCard(group, scenes) {
         ${switchInput(group.id, state.any_on, !state.count)}
       </div>
       ${state.count ? brightness(group.id, { ...state, on: state.any_on }) : ''}
+      ${readoutStrip(readouts)}
+      ${cameras.length ? cameraStill(cameras[0]) : ''}
       ${sceneButtons(scenes, group.scenes)}
     </div>`
   );
@@ -238,13 +257,17 @@ const empty = (title, body, action = '') => `
     ${action}
   </div>`;
 
+const inRoom = (list, roomId) => (list || []).filter((item) => item.room === roomId);
+
 function viewRooms(snapshot) {
   const rooms = snapshot.groups.filter((group) => group.kind === 'room');
   const zones = snapshot.groups.filter((group) => group.kind === 'zone');
   const loose = snapshot.devices.filter((device) => !device.room && device.kind !== 'bridge');
+  const card = (group) =>
+    groupCard(group, snapshot.scenes, inRoom(snapshot.readouts, group.id), inRoom(snapshot.cameras, group.id));
   return [
-    rooms.length ? section('Rooms', grid(rooms.map((room) => groupCard(room, snapshot.scenes)))) : '',
-    zones.length ? section('Zones', grid(zones.map((zone) => groupCard(zone, snapshot.scenes)))) : '',
+    rooms.length ? section('Rooms', grid(rooms.map(card))) : '',
+    zones.length ? section('Zones', grid(zones.map(card))) : '',
     loose.length ? section('Not in a room', grid(loose.map(deviceCard))) : '',
   ].join('') || empty('Nothing to show', 'No rooms are set up on this bridge.');
 }
@@ -253,6 +276,7 @@ function viewDevices(snapshot) {
   const kinds = [
     ['Lights', 'light'],
     ['Plugs', 'plug'],
+    ['Relays', 'relay'],
     ['Sensors', 'sensor'],
     ['Switches', 'switch'],
     ['Other', 'other'],
@@ -283,12 +307,15 @@ function viewCollections(snapshot) {
   return section('Collections', grid(snapshot.collections.map(collectionCard)), action);
 }
 
+const SOURCE_LABEL = { hue: 'Hue', shelly: 'Shelly' };
+
 function viewSettings(snapshot) {
   const bridges = snapshot.bridges
     .map(
       (bridge) => `<li class="list-group-item d-flex align-items-center gap-3">
         <div class="min-w-0 flex-grow-1">
-          <div class="fw-semibold text-truncate">${esc(bridge.name)}${
+          <div class="fw-semibold text-truncate">${esc(bridge.name)}
+            <span class="badge text-bg-light">${esc(SOURCE_LABEL[bridge.source] || bridge.source)}</span>${
         bridge.demo ? ' <span class="badge text-bg-secondary">demo</span>' : ''
       }</div>
           <div class="small text-secondary text-truncate">${esc(bridge.ip)} · ${esc(
@@ -298,6 +325,40 @@ function viewSettings(snapshot) {
         <button class="btn btn-sm btn-outline-danger" data-act="forget-bridge" data-id="${esc(bridge.id)}">Remove</button>
       </li>`
     )
+    .join('');
+
+  const found = (App.found || [])
+    .map(
+      (item) => `<li class="list-group-item d-flex align-items-center gap-3">
+        <div class="min-w-0 flex-grow-1">
+          <div class="fw-semibold text-truncate">${esc(item.name)}
+            <span class="badge text-bg-light">${esc(SOURCE_LABEL[item.source] || item.source)}</span></div>
+          <div class="small text-secondary">${esc(item.ip)} · ${esc(item.model || '')}</div>
+        </div>
+        <button class="btn btn-sm btn-primary" data-act="${item.source === 'shelly' ? 'adopt-shelly' : 'pair'}"
+          data-ip="${esc(item.ip)}" ${item.paired ? 'disabled' : ''}>${
+        item.paired ? 'Added' : item.source === 'shelly' ? 'Add' : 'Pair'
+      }</button>
+      </li>`
+    )
+    .join('');
+
+  const cameras = (snapshot.cameras || [])
+    .map((camera) => {
+      const room = byId(snapshot.groups, camera.room);
+      const trouble = camera.mode === 'needs_ffmpeg' || camera.mode === 'unconfigured';
+      return `<li class="list-group-item d-flex align-items-center gap-3">
+        <div class="min-w-0 flex-grow-1">
+          <div class="fw-semibold text-truncate">${esc(camera.name)}
+            <span class="badge text-bg-${trouble ? 'warning' : 'light'}">${esc(camera.mode.replace(/_/g, ' '))}</span></div>
+          <div class="small text-secondary text-truncate">${esc(camera.url || camera.snapshot_url || 'no address')}${
+        room ? ` · ${esc(room.name)}` : ''
+      }</div>
+        </div>
+        <button class="btn btn-sm btn-outline-secondary" data-act="edit-camera" data-id="${esc(camera.id)}">Edit</button>
+        <button class="btn btn-sm btn-outline-danger" data-act="delete-camera" data-id="${esc(camera.id)}">Remove</button>
+      </li>`;
+    })
     .join('');
 
   const network = snapshot.network || {};
@@ -313,13 +374,42 @@ function viewSettings(snapshot) {
 
   return [
     section(
-      'Bridges',
+      'Bridges and devices',
       `<div class="card"><ul class="list-group list-group-flush">${
-        bridges || '<li class="list-group-item text-secondary">No bridges paired.</li>'
+        bridges || '<li class="list-group-item text-secondary">Nothing paired yet.</li>'
       }</ul>
-        <div class="card-body d-flex flex-wrap gap-2">
-          <button class="btn btn-primary" data-act="add-bridge">Add a bridge</button>
-          <button class="btn btn-outline-secondary" data-act="add-demo">Add demo bridge</button>
+        <div class="card-body">
+          <div class="d-flex flex-wrap gap-2">
+            <button class="btn btn-primary" data-act="find" data-source="hue" ${App.searching ? 'disabled' : ''}>${
+        App.searching === 'hue' ? 'Searching…' : 'Find Hue bridges'
+      }</button>
+            <button class="btn btn-primary" data-act="find" data-source="shelly" ${App.searching ? 'disabled' : ''}>${
+        App.searching === 'shelly' ? 'Searching…' : 'Find Shelly devices'
+      }</button>
+            <button class="btn btn-outline-secondary" data-act="add-demo">Add demo bridge</button>
+          </div>
+          ${found ? `<ul class="list-group mt-3">${found}</ul>` : ''}
+          <div class="input-group mt-3">
+            <input type="text" class="form-control" id="manual-ip" placeholder="Address, e.g. 192.168.1.42"
+              inputmode="decimal" />
+            <button class="btn btn-outline-secondary" data-act="pair-manual">Pair a Hue bridge</button>
+            <button class="btn btn-outline-secondary" data-act="adopt-shelly-manual">Add a Shelly</button>
+          </div>
+          <p class="small text-secondary mt-2 mb-0">A Shelly needs no pairing. A Hue bridge needs its link
+            button pressed within 30 seconds.</p>
+        </div></div>`
+    ),
+    section(
+      'Cameras',
+      `<div class="card"><ul class="list-group list-group-flush">${
+        cameras || '<li class="list-group-item text-secondary">No cameras yet.</li>'
+      }</ul>
+        <div class="card-body">
+          <button class="btn btn-primary" data-act="new-camera">Add a camera</button>
+          ${snapshot.ffmpeg
+            ? '<p class="small text-secondary mt-2 mb-0">ffmpeg was found, so RTSP streams can be shown.</p>'
+            : `<p class="small text-secondary mt-2 mb-0">ffmpeg was not found, so RTSP cannot be converted for
+                the browser. Install it, or give the camera its snapshot URL instead.</p>`}
         </div></div>`
     ),
     section(
@@ -469,6 +559,73 @@ function panelDevice(device) {
     </div>`;
 }
 
+// Every value any device reports, as one flat list to choose from.
+const readableValues = (snapshot) =>
+  snapshot.devices.flatMap((device) =>
+    (device.readings || []).map((reading) => ({
+      value: `${device.id}|${reading.kind}`,
+      text: `${device.name} — ${reading.label} (${reading.display})`,
+      label: reading.label,
+    }))
+  );
+
+// The first option carries `selected`: without it morphdom syncs the select
+// to selectedIndex -1 and the control renders empty.
+function roomValues(group, snapshot) {
+  const mine = inRoom(snapshot.readouts, group.id);
+  const options = readableValues(snapshot);
+  return `
+    <h3 class="h6 text-secondary text-uppercase mt-4">Values</h3>
+    ${mine
+      .map(
+        (readout) => `<div class="d-flex align-items-center gap-3 py-2 border-bottom">
+          <span class="flex-grow-1 text-truncate">${esc(readout.label)}
+            <span class="text-secondary small">${esc(readout.device_name || 'device is gone')}</span></span>
+          <span class="fw-semibold">${esc(readout.display)}</span>
+          <button class="btn btn-sm btn-outline-danger" data-act="delete-readout"
+            data-id="${esc(readout.id)}">Remove</button>
+        </div>`
+      )
+      .join('')}
+    ${options.length
+      ? `<div class="row g-2 mt-2" data-static>
+          <div class="col-12"><select class="form-select" id="value-source" aria-label="Value to show">
+            ${options
+              .map(
+                (option, index) => `<option value="${esc(option.value)}" data-label="${esc(option.label)}" ${
+                  index === 0 ? 'selected' : ''
+                }>${esc(option.text)}</option>`
+              )
+              .join('')}
+          </select></div>
+          <div class="col"><input type="text" class="form-control" id="value-label" placeholder="Label, e.g. Temperature" /></div>
+          <div class="col-auto"><button class="btn btn-primary" data-act="add-readout"
+            data-id="${esc(group.id)}">Add value</button></div>
+        </div>`
+      : '<p class="text-secondary small mb-0">No device is reporting a value yet.</p>'}`;
+}
+
+function roomCameras(group, snapshot) {
+  const cameras = inRoom(snapshot.cameras, group.id);
+  if (!cameras.length) return '';
+  return `<h3 class="h6 text-secondary text-uppercase mt-4">Cameras</h3>
+    ${cameras
+      .map((camera) =>
+        camera.mode === 'needs_ffmpeg' || camera.mode === 'unconfigured'
+          ? `<div class="alert alert-warning py-2 small">${esc(camera.name)}: ${
+              camera.mode === 'needs_ffmpeg'
+                ? 'ffmpeg is not installed, so this RTSP stream cannot be shown here.'
+                : 'no RTSP or snapshot address is set.'
+            }</div>`
+          : `<figure class="mb-3">
+              <img class="camera-frame rounded" alt="${esc(camera.name)}"
+                src="/api/cameras/${encodeURIComponent(camera.id)}/stream" />
+              <figcaption class="small text-secondary mt-1">${esc(camera.name)} · live</figcaption>
+            </figure>`
+      )
+      .join('')}`;
+}
+
 function panelGroup(group, snapshot) {
   const state = group.state || {};
   const members = group.device_ids.map((id) => byId(snapshot.devices, id)).filter(Boolean);
@@ -482,6 +639,8 @@ function panelGroup(group, snapshot) {
     ${group.scenes.length
       ? `<h3 class="h6 text-secondary text-uppercase mt-4">Scenes</h3>${sceneButtons(snapshot.scenes, group.scenes)}`
       : ''}
+    ${roomCameras(group, snapshot)}
+    ${roomValues(group, snapshot)}
     <h3 class="h6 text-secondary text-uppercase mt-4">Devices</h3>
     ${members
       .map(
@@ -527,6 +686,45 @@ function panelCollection(collection, snapshot) {
     </div>`;
 }
 
+function panelCamera(snapshot, camera) {
+  const rooms = snapshot.groups.filter((group) => group.kind === 'room' || group.kind === 'zone');
+  return `
+    <label class="form-label" for="camera-name">Name</label>
+    <input type="text" class="form-control mb-3" id="camera-name" placeholder="Front door"
+      value="${esc(camera ? camera.name : '')}" />
+
+    <label class="form-label" for="camera-rtsp">RTSP address</label>
+    <input type="text" class="form-control" id="camera-rtsp" spellcheck="false" autocapitalize="off"
+      placeholder="rtsp://user:password@192.168.1.50:554/stream1" value="${esc(camera ? camera.url : '')}" />
+    <p class="form-text">${
+      snapshot.ffmpeg
+        ? 'Converted to a picture the browser can show, by ffmpeg on this machine.'
+        : 'ffmpeg was not found on this machine, so an RTSP address cannot be shown until it is installed.'
+    }</p>
+
+    <label class="form-label" for="camera-snapshot">Snapshot address (optional)</label>
+    <input type="text" class="form-control" id="camera-snapshot" spellcheck="false" autocapitalize="off"
+      placeholder="http://192.168.1.50/snapshot.jpg" value="${esc(camera ? camera.snapshot_url : '')}" />
+    <p class="form-text">Most cameras also serve a still image. It needs no ffmpeg and updates once a second.</p>
+
+    <label class="form-label" for="camera-room">Room</label>
+    <select class="form-select mb-4" id="camera-room">
+      <option value="">Not in a room</option>
+      ${rooms
+        .map(
+          (room) => `<option value="${esc(room.id)}" ${
+            camera && camera.room === room.id ? 'selected' : ''
+          }>${esc(room.name)}</option>`
+        )
+        .join('')}
+    </select>
+
+    <div class="d-flex gap-2">
+      <button class="btn btn-primary" data-act="save-camera" data-id="${esc(camera ? camera.id : '')}">Save</button>
+      <button class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+    </div>`;
+}
+
 function panelEditor(snapshot, collection) {
   const chosen = new Set(collection ? collection.members : []);
   const candidates = [
@@ -555,7 +753,7 @@ function panelEditor(snapshot, collection) {
     </div>
     <div class="d-flex gap-2">
       <button class="btn btn-primary" data-act="save-collection" data-id="${esc(collection ? collection.id : '')}">Save</button>
-      <button class="btn btn-outline-secondary" data-bs-dismiss="offcanvas">Cancel</button>
+      <button class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
     </div>`;
 }
 
@@ -572,6 +770,9 @@ function paint(root, html) {
     childrenOnly: true,
     onBeforeElUpdated: (from, to) => {
       if (from === holding || from === document.activeElement) return false;
+      // A form the user is part-way through filling in is theirs, not the
+      // server's: leave it, and its children, exactly as they left it.
+      if (from.dataset && from.dataset.static !== undefined) return false;
       return !from.isEqualNode(to);
     },
   });
@@ -613,12 +814,18 @@ function renderPanel() {
   if (!panel || !snapshot) return;
   const body = $('#panel-body');
   // The editor is a form, not a view of live data: once open it is the user's.
-  if (panel.kind === 'edit') {
-    const key = `edit:${panel.id || 'new'}`; // '' would collide with "nothing rendered"
+  if (panel.kind === 'edit' || panel.kind === 'camera') {
+    const key = `${panel.kind}:${panel.id || 'new'}`; // '' would collide with "nothing rendered"
     if (body.dataset.editor === key) return;
-    const collection = panel.id ? byId(snapshot.collections, panel.id) : null;
-    $('#panel-title').textContent = collection ? 'Edit collection' : 'New collection';
-    body.innerHTML = panelEditor(snapshot, collection);
+    if (panel.kind === 'camera') {
+      const camera = panel.id ? byId(snapshot.cameras, panel.id) : null;
+      $('#panel-title').textContent = camera ? 'Edit camera' : 'Add a camera';
+      body.innerHTML = panelCamera(snapshot, camera);
+    } else {
+      const collection = panel.id ? byId(snapshot.collections, panel.id) : null;
+      $('#panel-title').textContent = collection ? 'Edit collection' : 'New collection';
+      body.innerHTML = panelEditor(snapshot, collection);
+    }
     body.dataset.editor = key;
     return;
   }
@@ -656,7 +863,7 @@ function applyTheme() {
 
 // --- panel plumbing ----------------------------------------------------------
 
-const panelElement = () => bootstrap.Offcanvas.getOrCreateInstance($('#panel'));
+const panelElement = () => bootstrap.Modal.getOrCreateInstance($('#panel'));
 
 function openPanel(kind, id) {
   App.panel = { kind, id };
@@ -666,9 +873,11 @@ function openPanel(kind, id) {
   panelElement().show();
 }
 
-$('#panel').addEventListener('hidden.bs.offcanvas', () => {
+$('#panel').addEventListener('hidden.bs.modal', () => {
   App.panel = null;
   $('#panel-body').dataset.editor = '';
+  // Emptying it closes any live camera connection the modal was holding open.
+  $('#panel-body').innerHTML = '';
 });
 
 // --- actions -----------------------------------------------------------------
@@ -724,19 +933,69 @@ const actions = {
       })
       .catch(fail);
   },
-  discover: () => {
-    App.searching = true;
+  discover: () => actions.find({ dataset: { source: 'hue' } }),
+  find: (element) => {
+    const source = element.dataset.source || 'hue';
+    App.searching = source;
     render();
-    api('POST', '/api/discover', { deep: true })
+    api('POST', '/api/discover', { source, deep: true })
       .then((result) => {
-        App.discovered = result.bridges;
-        if (!result.bridges.length) toast('No bridge found on this network', true);
+        App.found = result.bridges;
+        if (source === 'hue') App.discovered = result.bridges;
+        if (!result.bridges.length) toast(`No ${SOURCE_LABEL[source]} device answered on this network`, true);
       })
       .catch(fail)
       .finally(() => {
         App.searching = false;
         render();
       });
+  },
+  'adopt-shelly': (element) => adoptShelly(element.dataset.ip),
+  'adopt-shelly-manual': () => {
+    const value = $('#manual-ip').value.trim();
+    if (value) adoptShelly(value);
+  },
+  'add-readout': (element) => {
+    const picker = $('#value-source');
+    const [device, kind] = picker.value.split('|');
+    const chosen = picker.selectedOptions[0];
+    const label = $('#value-label').value.trim() || (chosen ? chosen.dataset.label : '') || kind;
+    api('POST', '/api/readouts', { device, kind, label, room: element.dataset.id })
+      .then(() => {
+        toast('Value added');
+        return refresh();
+      })
+      .catch(fail);
+  },
+  'delete-readout': (element) =>
+    api('DELETE', `/api/readouts/${encodeURIComponent(element.dataset.id)}`).then(refresh).catch(fail),
+  'new-camera': () => openPanel('camera', ''),
+  'edit-camera': (element) => openPanel('camera', element.dataset.id),
+  'save-camera': (element) => {
+    const body = {
+      name: $('#camera-name').value.trim(),
+      rtsp_url: $('#camera-rtsp').value.trim(),
+      snapshot_url: $('#camera-snapshot').value.trim(),
+      room: $('#camera-room').value || null,
+    };
+    const id = element.dataset.id;
+    // A masked URL left untouched must not be written back over the real one.
+    if (id && /:\*\*\*@/.test(body.rtsp_url)) delete body.rtsp_url;
+    if (id && /:\*\*\*@/.test(body.snapshot_url)) delete body.snapshot_url;
+    const request = id
+      ? api('PUT', `/api/cameras/${encodeURIComponent(id)}`, body)
+      : api('POST', '/api/cameras', body);
+    request
+      .then(() => {
+        panelElement().hide();
+        toast('Camera saved');
+        return refresh();
+      })
+      .catch(fail);
+  },
+  'delete-camera': (element) => {
+    if (!confirm('Remove this camera?')) return;
+    api('DELETE', `/api/cameras/${encodeURIComponent(element.dataset.id)}`).then(refresh).catch(fail);
   },
   pair: (element) => pair(element.dataset.ip),
   'pair-manual': () => {
@@ -758,6 +1017,16 @@ const actions = {
   },
   scan: () => api('POST', '/api/scan', {}).then(() => toast('Scanning…')).catch(fail),
 };
+
+function adoptShelly(ip) {
+  api('POST', '/api/shelly', { ip })
+    .then((result) => {
+      App.found = null;
+      toast(`Added ${result.device.name}`);
+      return refresh();
+    })
+    .catch(fail);
+}
 
 function pair(ip) {
   toast(`Pairing with ${ip} — press the link button`);

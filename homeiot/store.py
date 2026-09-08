@@ -18,9 +18,11 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 CONFIG_PATH = DATA_DIR / "config.json"
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "version": 1,
-    "bridges": [],
+    "version": 2,
+    "bridges": [],  # every gateway or standalone device we talk to
     "collections": [],
+    "readouts": [],  # device values pinned to a room, with your own label
+    "cameras": [],
     "ui": {"theme": "auto"},
 }
 
@@ -101,9 +103,53 @@ def drop_collection(config: dict[str, Any], collection_id: str) -> dict[str, Any
 
 
 def forget_devices(config: dict[str, Any], device_ids: set[str]) -> dict[str, Any]:
-    """Drop stale members (e.g. after a bridge is removed)."""
+    """Drop stale members and readouts (e.g. after a bridge is removed)."""
     collections = [
         {**item, "members": [m for m in item["members"] if m not in device_ids]}
         for item in config["collections"]
     ]
-    return {**config, "collections": collections}
+    readouts = [item for item in config.get("readouts", []) if item["device"] not in device_ids]
+    return {**config, "collections": collections, "readouts": readouts}
+
+
+# --- readouts ----------------------------------------------------------------
+# A readout pins one value a device reports -- temperature, humidity, power --
+# to a room, under a label you choose.  The room card then shows it.
+
+
+def normalise_readout(raw: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    base = existing or {"id": new_id("val-"), "order": 0}
+    device = str(raw.get("device", base.get("device", ""))).strip()
+    kind = str(raw.get("kind", base.get("kind", ""))).strip()
+    room = raw.get("room", base.get("room"))
+    if not device or not kind:
+        raise ValueError("a readout needs a device and a value to read")
+    return {
+        **base,
+        "label": str(raw.get("label", base.get("label", ""))).strip()[:40] or kind.replace("_", " ").title(),
+        "device": device,
+        "kind": kind,
+        "room": str(room) if room else None,
+        "order": int(raw.get("order", base["order"])),
+    }
+
+
+def put_readout(config: dict[str, Any], readout: dict[str, Any]) -> dict[str, Any]:
+    others = [item for item in config.get("readouts", []) if item["id"] != readout["id"]]
+    return {**config, "readouts": sorted([*others, readout], key=lambda item: (item["order"], item["label"]))}
+
+
+def drop_readout(config: dict[str, Any], readout_id: str) -> dict[str, Any]:
+    return {**config, "readouts": [r for r in config.get("readouts", []) if r["id"] != readout_id]}
+
+
+# --- cameras -----------------------------------------------------------------
+
+
+def put_camera(config: dict[str, Any], camera: dict[str, Any]) -> dict[str, Any]:
+    others = [item for item in config.get("cameras", []) if item["id"] != camera["id"]]
+    return {**config, "cameras": sorted([*others, camera], key=lambda item: item["name"].lower())}
+
+
+def drop_camera(config: dict[str, Any], camera_id: str) -> dict[str, Any]:
+    return {**config, "cameras": [c for c in config.get("cameras", []) if c["id"] != camera_id]}

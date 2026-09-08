@@ -1,9 +1,11 @@
 # homeiot
 
 A local dashboard for the IoT devices on your own network. It finds your
-Philips Hue bridge, shows every device it can reach with its live state, and
-lets you control the ones that can be controlled — lamps, plugs, rooms, zones,
-scenes, and your own cross-cutting **Collections**.
+Philips Hue bridge and your Shelly devices, shows everything it can reach with
+its live state, and lets you control what can be controlled — lamps, plugs,
+relays, rooms, zones, scenes, and your own cross-cutting **Collections**.
+Room cards can also carry the values you care about (temperature, humidity,
+power) and a camera's picture.
 
 It runs on your machine, talks only to your LAN, and stores everything under
 `homeiot/data/`. No cloud account, no broker, nothing to install.
@@ -19,6 +21,9 @@ python3 -m homeiot --demo     # simulated devices, no hardware needed
 Python 3.11+, standard library only. The browser side uses Bootstrap and
 morphdom, both vendored in `web/vendor/` -- the tablet must keep working when
 the internet does not, so nothing is fetched from a CDN at runtime.
+
+The one optional extra is **ffmpeg**, and only for RTSP cameras: everything
+else works without it.
 
 ---
 
@@ -95,7 +100,29 @@ picker; either way clamped to the lamp's actual gamut), colour temperature in
 kelvin, effects (candle, fire, sparkle, prism …), identify, rename. Devices
 with several lamps inside them get per-lamp switches too.
 
-**Plugs** — on/off.
+**Plugs and relays** — on/off, with whatever the device meters.
+
+**Shelly** — Gen1 (Shelly 1, 2.5, Plug S, H&T …) and Gen2+ (Plus, Pro, Gen3/4)
+over plain HTTP, found by mDNS or by a sweep of your subnet, or added by
+address. Relays, dimmers and plugs switch and dim; power, voltage, energy,
+temperature, humidity and battery are read. A device with a password set is
+reported as such rather than half-working — neither Gen1 Basic nor Gen2 Digest
+auth is implemented yet.
+
+**Values on a room card** — pin any value a device reports to any room, with a
+label you choose: *Temperature 21.9 °C*, *Energy usage 842 W*. The device does
+not have to be in that room, which is the point: a Shelly in the utility
+cupboard can report the living-room temperature. Add and remove them in the
+room's own window.
+
+**Cameras** — give a camera an RTSP address and it appears on its room's card
+as a still and in the room's window as a live picture. No browser can play
+RTSP, so ffmpeg on this machine converts it to a picture stream any browser can
+show, in an ordinary `<img>` — no player, no plugin. Without ffmpeg, give the
+camera its snapshot URL instead (most cameras have one) and it updates once a
+second; if neither is possible the dashboard says so rather than showing a
+broken picture. Credentials in the address are stored in the config file and
+masked everywhere they would otherwise be shown.
 
 **Sensors** — motion, temperature, illuminance in lux, contact and tamper for
 the secure range, battery level, and how long ago each reading changed.
@@ -122,10 +149,11 @@ mix of devices, rooms and zones under one name, controlled together. "Evening",
 > collection". Renaming it later is a one-word change in `app.js` and the
 > `collections` key in `config.json`.
 
-**Settings** — pair and remove bridges, and scan the LAN for everything else
-answering mDNS or SSDP: HomeKit accessories, Matter devices, Shelly and Tasmota
-nodes, ESPHome, Cast targets, printers. They are listed, not controlled; Hue is
-the integration that exists today.
+**Settings** — find, add and remove Hue bridges and Shelly devices, manage
+cameras, and scan the LAN for everything else answering mDNS or SSDP: HomeKit
+accessories, Matter devices, Tasmota nodes, ESPHome, Cast targets, printers.
+Those are listed, not controlled; Hue and Shelly are the integrations that
+exist today.
 
 ## Live updates
 
@@ -145,7 +173,7 @@ Every control is the browser's own, styled by Bootstrap:
 | Dimmer, warmth | `<input type="range">` |
 | Colour | preset buttons and `<input type="color">` |
 | Effect | `<select>` |
-| Detail panel | Bootstrap offcanvas |
+| Detail panel | Bootstrap modal, centred above the page |
 
 That is the whole design rule, and it is what makes it reliable on a tablet:
 touch handling, momentum, focus rings, keyboard support, the OS colour picker
@@ -169,7 +197,9 @@ homeiot/
 ├── discovery.py     mDNS, SSDP, cloud discovery, subnet sweep
 ├── color.py         xy <-> sRGB, mired <-> kelvin, gamut clamping
 ├── store.py         config.json, atomically, 0600
-├── demo.py          a simulated bridge with a full range of devices
+├── shelly.py        Shelly Gen1 and Gen2+: discovery, reading, control
+├── camera.py        RTSP via ffmpeg, snapshot polling, URL masking
+├── demo.py          a simulated bridge, Shelly and camera
 ├── web/             index.html, app.css, app.js — no build step
 │   └── vendor/      bootstrap.min.css, bootstrap.bundle.min.js, morphdom
 ├── data/            config.json lives here (gitignored)
@@ -205,6 +235,11 @@ curl -X PUT http://localhost:8712/api/targets/hue:001788.../state \
 | POST | `/api/scenes/<id>/recall` | recall a scene |
 | POST | `/api/devices/<id>/identify` | make it blink |
 | GET/POST/PUT/DELETE | `/api/collections[/<id>]` | manage collections |
+| POST | `/api/shelly` | `{"ip": "..."}` — adopt a Shelly, no pairing needed |
+| GET/POST/PUT/DELETE | `/api/readouts[/<id>]` | values pinned to a room |
+| GET/POST/PUT/DELETE | `/api/cameras[/<id>]` | cameras |
+| GET | `/api/cameras/<id>/frame` | one still image |
+| GET | `/api/cameras/<id>/stream` | live multipart JPEG for an `<img>` |
 | POST | `/api/scan` | scan the LAN for other IoT hosts |
 | POST | `/api/refresh` | re-read every bridge now |
 
@@ -238,7 +273,7 @@ else in the app skips verification.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s homeiot/tests -t .     # 37 unit tests, no network
+python3 -m unittest discover -s homeiot/tests -t .     # 53 unit tests, no network
 
 python3 -m homeiot --demo &                            # end-to-end, needs Playwright
 node homeiot/tests/e2e.mjs
@@ -247,15 +282,20 @@ node homeiot/tests/e2e.mjs
 The end-to-end script drives a real browser with a **touchscreen and a tablet
 viewport**, taps rather than clicks, and asserts that each interaction actually
 changed the state on the server: switches, dimmers, colour, colour temperature,
-effects, scenes, collections and theme. It also measures every touch target,
+effects, scenes, collections, Shelly switching, values pinned to a room, the
+camera still and live view, and theme. It also measures every touch target,
 checks that live updates patch the page instead of rebuilding it, and checks
 that nothing scrolls sideways at phone, tablet-portrait and tablet-landscape
 widths.
 
 ## Adding another integration
 
-`hue.py` and `demo.py` are interchangeable transports: both expose
-`snapshot(bridge)` returning CLIP v2 shaped resources and `send(bridge, rtype,
-rid, payload)`. `hub.transport()` picks between them. A new integration means a
-third module of that shape plus a normaliser branch in `model.py` — the UI,
-grouping, collections and event plumbing come for free.
+`hue.py`, `shelly.py` and `demo.py` are interchangeable transports. Each
+exposes `snapshot(device)` and `send(device, rtype, rid, payload)`, and may
+expose `home(device, raw)` to normalise its own data into the shared shape
+(Hue's lives in `model.py`). `hub.transport()` picks between them by the
+`source` on the stored device.
+
+A fourth integration is one more module of that shape. Ids are
+`source:gateway:type:id`, so grouping, collections, pinned values, the UI and
+the event plumbing all come for free — Shelly took no changes to any of them.

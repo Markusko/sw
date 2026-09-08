@@ -107,8 +107,36 @@ label,
   min-width: 0; /* lets text-truncate work inside a flex row */
 }
 
-.offcanvas-end {
-  width: min(30rem, 100vw);
+/* A full-height sheet on a phone, a centred dialog on anything larger. */
+@media (max-width: 34rem) {
+  .modal-dialog {
+    margin: 0;
+    min-height: 100%;
+  }
+  .modal-content {
+    min-height: 100vh;
+    border: 0;
+    border-radius: 0;
+  }
+}
+
+.camera-frame {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  background: var(--bs-secondary-bg);
+}
+
+.camera-thumb {
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  width: 100%;
+  max-height: 8.5rem; /* a glance on the card; the live view is in the modal */
+  background: var(--bs-secondary-bg);
+}
+
+.readout .value {
+  font-variant-numeric: tabular-nums;
 }
 
 .card {

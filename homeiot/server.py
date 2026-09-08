@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import demo, hue, hub as hub_module, model, net, store
+from . import camera, demo, hue, hub as hub_module, model, net, shelly, store
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 CONTENT_TYPES = {
@@ -66,7 +66,23 @@ def post_refresh(hub: dict[str, Any], _match, _body, _query) -> Any:
 
 
 def post_discover(hub: dict[str, Any], _match, body, _query) -> Any:
-    return {"bridges": hub_module.discover(hub, deep=bool(body.get("deep")))}
+    source = str(body.get("source", "hue"))
+    return {"bridges": hub_module.discover(hub, source=source, deep=bool(body.get("deep")))}
+
+
+def post_shelly(hub: dict[str, Any], _match, body, _query) -> Any:
+    """Shelly devices need no pairing -- an address is the whole handshake."""
+    ip = str(body.get("ip", "")).strip()
+    if not ip:
+        raise ApiError("an address is required")
+    found = shelly.probe(ip)
+    if not found:
+        raise ApiError(f"no Shelly device answered at {ip}", 404)
+    if found["protected"]:
+        raise ApiError(f"{found['name']} has a password set, which is not supported yet", 501)
+    device = shelly.make_device(found)
+    hub_module.add_bridge(hub, device)
+    return {"ok": True, "device": {key: device[key] for key in ("id", "name", "ip", "model", "generation")}}
 
 
 def post_pair(hub: dict[str, Any], _match, body, _query) -> Any:
@@ -164,6 +180,58 @@ def post_scan(hub: dict[str, Any], _match, _body, _query) -> Any:
     return hub_module.scan_network(hub)
 
 
+def post_readout(hub: dict[str, Any], _match, body, _query) -> Any:
+    try:
+        readout = store.normalise_readout(body)
+    except ValueError as error:
+        raise ApiError(str(error)) from error
+    hub_module.mutate_config(hub, lambda config: store.put_readout(config, readout))
+    return {"ok": True, "readout": readout}
+
+
+def put_readout(hub: dict[str, Any], match, body, _query) -> Any:
+    existing = next((r for r in hub["config"].get("readouts", []) if r["id"] == match.group("id")), None)
+    if not existing:
+        raise ApiError("no such value", 404)
+    try:
+        readout = store.normalise_readout(body, existing)
+    except ValueError as error:
+        raise ApiError(str(error)) from error
+    hub_module.mutate_config(hub, lambda config: store.put_readout(config, readout))
+    return {"ok": True, "readout": readout}
+
+
+def delete_readout(hub: dict[str, Any], match, _body, _query) -> Any:
+    hub_module.mutate_config(hub, lambda config: store.drop_readout(config, match.group("id")))
+    return {"ok": True}
+
+
+def post_camera(hub: dict[str, Any], _match, body, _query) -> Any:
+    try:
+        item = camera.normalise({**body, "id": store.new_id("cam-")})
+    except ValueError as error:
+        raise ApiError(str(error)) from error
+    hub_module.mutate_config(hub, lambda config: store.put_camera(config, item))
+    return {"ok": True, "camera": camera.describe(item)}
+
+
+def put_camera(hub: dict[str, Any], match, body, _query) -> Any:
+    existing = hub_module.find_camera(hub, match.group("id"))
+    if not existing:
+        raise ApiError("no such camera", 404)
+    try:
+        item = camera.normalise(body, existing)
+    except ValueError as error:
+        raise ApiError(str(error)) from error
+    hub_module.mutate_config(hub, lambda config: store.put_camera(config, item))
+    return {"ok": True, "camera": camera.describe(item)}
+
+
+def delete_camera(hub: dict[str, Any], match, _body, _query) -> Any:
+    hub_module.mutate_config(hub, lambda config: store.drop_camera(config, match.group("id")))
+    return {"ok": True}
+
+
 ROUTES: list[tuple[str, re.Pattern, Handler]] = [
     ("GET", re.compile(r"^/api/state$"), get_state),
     ("POST", re.compile(r"^/api/refresh$"), post_refresh),
@@ -180,7 +248,17 @@ ROUTES: list[tuple[str, re.Pattern, Handler]] = [
     ("DELETE", re.compile(r"^/api/collections/(?P<id>[^/]+)$"), delete_collection),
     ("PUT", re.compile(r"^/api/ui$"), put_ui),
     ("POST", re.compile(r"^/api/scan$"), post_scan),
+    ("POST", re.compile(r"^/api/shelly$"), post_shelly),
+    ("POST", re.compile(r"^/api/readouts$"), post_readout),
+    ("PUT", re.compile(r"^/api/readouts/(?P<id>[^/]+)$"), put_readout),
+    ("DELETE", re.compile(r"^/api/readouts/(?P<id>[^/]+)$"), delete_readout),
+    ("POST", re.compile(r"^/api/cameras$"), post_camera),
+    ("PUT", re.compile(r"^/api/cameras/(?P<id>[^/]+)$"), put_camera),
+    ("DELETE", re.compile(r"^/api/cameras/(?P<id>[^/]+)$"), delete_camera),
 ]
+
+CAMERA_FRAME = re.compile(r"^/api/cameras/(?P<id>[^/]+)/frame$")
+CAMERA_STREAM = re.compile(r"^/api/cameras/(?P<id>[^/]+)/stream$")
 
 
 # --- request handling --------------------------------------------------------
@@ -273,6 +351,13 @@ def make_handler(hub: dict[str, Any], token: str | None):
                     return self._json(403, {"error": "cross-origin writes are refused"})
                 if path == "/api/events":
                     return self._stream()
+                if self.command in ("GET", "HEAD"):
+                    still = CAMERA_FRAME.match(path)
+                    if still:
+                        return self._camera_frame(still.group("id"))
+                    live = CAMERA_STREAM.match(path)
+                    if live:
+                        return self._camera_stream(live.group("id"))
                 candidates = [(method, pattern.match(path), handler) for method, pattern, handler in ROUTES]
                 candidates = [(method, match, handler) for method, match, handler in candidates if match]
                 for method, match, handler in candidates:
@@ -324,12 +409,55 @@ def make_handler(hub: dict[str, Any], token: str | None):
             finally:
                 hub_module.unsubscribe(hub, channel)
 
+        # -- cameras
+        def _camera_frame(self, camera_id: str) -> None:
+            item = hub_module.find_camera(hub, camera_id)
+            if not item:
+                return self._json(404, {"error": "no such camera"})
+            try:
+                content_type, payload = camera.frame(item)
+            except camera.CameraError as error:
+                return self._json(503, {"error": camera.redact(str(error))})
+            self._send(200, payload, content_type, {"Cache-Control": "no-store"})
+
+        def _camera_stream(self, camera_id: str) -> None:
+            """A live view as multipart JPEG, which every browser can show in an <img>."""
+            item = hub_module.find_camera(hub, camera_id)
+            if not item:
+                return self._json(404, {"error": "no such camera"})
+            if camera.mode(item) in ("needs_ffmpeg", "unconfigured"):
+                return self._json(503, {"error": camera.redact(_camera_reason(item))})
+
+            boundary = "homeiotframe"
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={boundary}")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                for content_type, payload in camera.frames(item, lambda: hub["stopping"].is_set()):
+                    head = f"--{boundary}\r\nContent-Type: {content_type}\r\n"
+                    head += f"Content-Length: {len(payload)}\r\n\r\n"
+                    self.wfile.write(head.encode())
+                    self.wfile.write(payload)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+            except (*DISCONNECTS, camera.CameraError, OSError):
+                pass  # the viewer closed the tab, or the camera went away
+
         def _emit(self, event: str, payload: Any) -> None:
             data = json.dumps(payload, default=str)
             self.wfile.write(f"event: {event}\ndata: {data}\n\n".encode())
             self.wfile.flush()
 
     return DashboardHandler
+
+
+def _camera_reason(item: dict[str, Any]) -> str:
+    if camera.mode(item) == "needs_ffmpeg":
+        return "ffmpeg is not installed, so this RTSP stream cannot be shown"
+    return "this camera has neither an RTSP nor a snapshot address"
 
 
 def _cookie(header: str, name: str) -> str | None:
@@ -347,7 +475,12 @@ def build_hub(demo_mode: bool = False) -> dict[str, Any]:
     config = store.load()
     hub = hub_module.create(config)
     if demo_mode and not any(bridge.get("demo") for bridge in config.get("bridges", [])):
-        hub["config"] = store.put_bridge(config, dict(demo.BRIDGE))
+        config = store.put_bridge(config, dict(demo.BRIDGE))
+        config = store.put_bridge(config, dict(demo.SHELLY))
+        config = store.put_camera(config, dict(demo.CAMERA))
+        for readout in demo.READOUTS:
+            config = store.put_readout(config, dict(readout))
+        hub["config"] = config
     return hub
 
 

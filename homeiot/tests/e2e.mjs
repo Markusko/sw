@@ -211,6 +211,117 @@ for (const [label, width, height] of [['phone', 390, 844], ['tablet portrait', 8
   check(`no sideways scrolling on ${label}`, spill <= 0, `overflow=${spill}px`);
 }
 
+// 13. the detail panel is a modal, above the page, not a side panel
+await page.setViewportSize({ width: 820, height: 1180 });
+await page.locator('#tabs .nav-link', { hasText: 'Rooms' }).tap();
+await page.waitForTimeout(600);
+await openPanel('Living room');
+const box = await page.locator('#panel .modal-dialog').boundingBox();
+check('the detail panel is a centred modal, not a side panel',
+  box.x > 20 && box.x + box.width < 820 - 20, `x=${Math.round(box.x)} w=${Math.round(box.width)}`);
+check('the modal has a backdrop', (await page.locator('.modal-backdrop').count()) === 1);
+
+// --- pinned values show in the room modal and on the card
+const valueRows = await page.locator('#panel', { hasText: 'VALUES' }).count();
+check('the room modal has a Values section', valueRows > 0);
+await closePanel();
+
+const strip = await card('Living room').locator('.readout').textContent();
+check('the room card shows its pinned values', /Temperature/.test(strip) && /Humidity/.test(strip),
+  strip.replace(/\s+/g, ' ').trim().slice(0, 80));
+
+// --- add a value to another room, through the UI
+await openPanel('Kitchen');
+await page.selectOption('#value-source', 'shelly:demoshelly1pm:switch:0|power');
+await page.fill('#value-label', 'Boiler draw');
+await page.locator('[data-act="add-readout"]').tap();
+await page.waitForTimeout(1200);
+snapshot = await state();
+const added = snapshot.readouts.find((r) => r.label === 'Boiler draw');
+check('a value can be pinned to a room from the UI', !!added && /W$/.test(added.display),
+  added ? `${added.label} = ${added.display}` : 'not created');
+await closePanel();
+await page.waitForTimeout(800);
+check('the new value appears on that room card',
+  /Boiler draw/.test(await card('Kitchen').locator('.readout').textContent()));
+
+// --- and can be removed again
+await openPanel('Kitchen');
+await page.locator('#panel [data-act="delete-readout"]').first().tap();
+await page.waitForTimeout(1000);
+snapshot = await state();
+check('a pinned value can be removed', !snapshot.readouts.some((r) => r.label === 'Boiler draw'));
+await closePanel();
+
+// --- the camera: still on the card, live stream in the modal
+const thumb = card('Hallway').locator('img.camera-thumb');
+check('the room card shows a camera still', (await thumb.count()) === 1);
+const loaded = await thumb.evaluate((img) =>
+  img.complete ? img.naturalWidth > 0 : new Promise((done) => {
+    img.addEventListener('load', () => done(img.naturalWidth > 0), { once: true });
+    img.addEventListener('error', () => done(false), { once: true });
+  })
+);
+check('the camera still actually renders', loaded);
+
+await openPanel('Hallway');
+const live = page.locator('#panel img.camera-frame');
+check('the room modal offers a live view', (await live.count()) === 1);
+const playing = await live.evaluate((img) =>
+  new Promise((done) => {
+    if (img.naturalWidth > 0) return done(true);
+    img.addEventListener('load', () => done(true), { once: true });
+    img.addEventListener('error', () => done(false), { once: true });
+    setTimeout(() => done(img.naturalWidth > 0), 4000);
+  })
+);
+check('the live view is receiving frames', playing);
+await closePanel();
+
+// --- Shelly device is present and controllable
+await page.locator('#tabs .nav-link', { hasText: 'Devices' }).tap();
+await page.waitForTimeout(600);
+const relay = card('Boiler relay');
+check('the Shelly device has a card', (await relay.count()) === 1);
+const readings = await relay.textContent();
+check('the Shelly card shows its measurements', /W/.test(readings) && /°C/.test(readings),
+  readings.replace(/\s+/g, ' ').trim().slice(0, 90));
+
+const wasOn = (await state()).devices.find((d) => d.name === 'Boiler relay').state.on;
+await relay.locator('input[role=switch]').tap();
+await page.waitForTimeout(1400);
+snapshot = await state();
+const shelly = snapshot.devices.find((d) => d.name === 'Boiler relay');
+check('tapping the Shelly switch reaches the device', shelly.state.on === !wasOn,
+  `${wasOn} -> ${shelly.state.on}`);
+check('the Shelly reports the power it now draws',
+  shelly.readings.some((r) => r.kind === 'power' && (shelly.state.on ? r.value > 0 : r.value === 0)));
+
+// --- adding a camera through the UI
+await page.locator('#tabs .nav-link', { hasText: 'Settings' }).tap();
+await page.waitForTimeout(500);
+check('settings lists both integrations',
+  /Hue/.test(await page.locator('#main').textContent()) && /Shelly/.test(await page.locator('#main').textContent()));
+check('settings offers a Shelly search', (await page.locator('[data-act="find"][data-source="shelly"]').count()) === 1);
+
+await page.locator('[data-act="new-camera"]').tap();
+await page.waitForSelector('#camera-name');
+await page.fill('#camera-name', 'Garage');
+await page.fill('#camera-rtsp', 'rtsp://admin:hunter2@10.0.0.9:554/h264');
+await page.selectOption('#camera-room', { label: 'Kitchen' });
+await page.locator('[data-act="save-camera"]').tap();
+await page.waitForTimeout(1200);
+snapshot = await state();
+const camera = snapshot.cameras.find((c) => c.name === 'Garage');
+check('a camera can be added from the UI', !!camera, camera ? camera.mode : 'not created');
+check('the API never hands back the camera password', !!camera && !/hunter2/.test(JSON.stringify(snapshot)),
+  camera ? camera.url : '');
+
+await page.locator(`[data-act="delete-camera"][data-id="${camera.id}"]`).tap();
+await page.waitForTimeout(1000);
+snapshot = await state();
+check('a camera can be removed', !snapshot.cameras.some((c) => c.name === 'Garage'));
+
 console.log(errors.length ? 'CONSOLE ERRORS:\n' + errors.join('\n') : 'no console errors');
 console.log(failures ? `${failures} FAILED` : 'all checks passed');
 await browser.close();
