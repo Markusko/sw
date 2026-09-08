@@ -585,7 +585,8 @@ def main(argv: list[str] | None = None) -> int:
         address = arguments.probe_box
         if address is True or address == "auto":
             address = swisscom.gateway_candidates()[0]
-        print(f"reading {address} — this follows the box's own web app, so give it a moment\n")
+        print(f"reading {address} — this follows the box's own web app and then asks it "
+              "about everything that app names, so give it up to a minute\n")
         print(swisscom.report(swisscom.survey(address)))
         return 0
 

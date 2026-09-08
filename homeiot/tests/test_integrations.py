@@ -337,24 +337,33 @@ class AnnouncementTests(unittest.TestCase):
 
 
 # --- a fake Internet-Box -----------------------------------------------------
-# An Arcadyan-style box: a single-page app whose scripts name the endpoints,
-# which is exactly what the prober is there to read.
+# Modelled on the real one: a Vite build that joins a base onto relative paths
+# rather than writing "/api/..." out, a lazily loaded chunk holding half the
+# endpoints, and a /ws that drops a POST but accepts a websocket handshake.
+# Reading this box means reading the way it is written, not pattern-matching.
 
 BOX_PAGE = """<!DOCTYPE html><html><head><title>Internet-Box</title>
-<meta name="viewport" content="width=device-width"></head>
+<meta name="viewport" content="width=device-width">
+<link rel="modulepreload" href="/assets/vendor-8b21c0.js"></head>
 <body><div id="app"></div>
-<script src="/static/js/chunk-vendors.4f1a.js"></script>
-<script src="/static/js/app.9c2b.js"></script>
+<script type="module" crossorigin src="/assets/index-Dl-CRwBR.js"></script>
 <script src="https://example.invalid/tracker.js"></script>
 </body></html>"""
 
 BOX_APP_JS = """
-!function(){var e={login:"/api/v1/session",info:"/api/v1/system/deviceinfo",
-hosts:"/api/v1/network/hosts",legacy:'/data/status.json',
-socket:"/ws/events"};
-axios.get("/api/v1/system/deviceinfo").then(...);
-var t="not/a/path";var u="/assets/logo.svg";
-}();
+const B="/cgi/json-req";const V="v1/";
+async function q(s){return fetch(B,{method:"POST",headers:{"Content-Type":"application/json"},
+body:JSON.stringify({service:s,method:"get"})})}
+const info=()=>fetch("/api/"+V+"system/deviceinfo");
+const login=()=>fetch("/api/v1/session",{method:"POST"});
+const live=()=>new WebSocket("ws://"+location.host+"/ws");
+const later=()=>import("./detail-3a1f77.js");
+var u="/assets/logo.svg";var m="application/json";
+"""
+
+BOX_CHUNK_JS = """
+const hosts=()=>fetch("/api/v1/network/hosts");
+const legacy=()=>fetch('/data/status.json');
 """
 
 
@@ -363,11 +372,15 @@ class BoxHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.headers.get("Upgrade", "").lower() == "websocket":
+            return self._upgrade() if self.path == "/ws" else self._send(404, "no", "text/html")
         if self.path == "/":
             return self._send(200, BOX_PAGE, "text/html")
-        if self.path.endswith("app.9c2b.js"):
+        if self.path.endswith("index-Dl-CRwBR.js"):
             return self._send(200, BOX_APP_JS, "application/javascript")
-        if self.path.endswith("chunk-vendors.4f1a.js"):
+        if self.path.endswith("detail-3a1f77.js"):
+            return self._send(200, BOX_CHUNK_JS, "application/javascript")
+        if self.path.endswith("vendor-8b21c0.js"):
             return self._send(200, "/* vendor bundle, nothing of ours */", "application/javascript")
         if self.path == "/api/v1/system/deviceinfo":
             return self._send(200, json.dumps({"model": "PRV65AX", "firmware": "15.20.46"}),
@@ -379,7 +392,18 @@ class BoxHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         self.rfile.read(length)
+        if self.path == "/ws":  # a socket route has nothing to say to a POST
+            self.close_connection = True
+            return
         self._send(404, "<html>404</html>", "text/html")
+
+    def _upgrade(self):
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Protocol", "sah-ws")
+        self.end_headers()
+        self.close_connection = True
 
     def _send(self, status, body, content_type):
         payload = body.encode()
@@ -416,17 +440,37 @@ class InternetBoxProbeTests(unittest.TestCase):
 
     def test_it_follows_the_scripts_the_page_loads(self):
         urls = [asset["url"] for asset in self.found["assets"]]
-        self.assertTrue(any("app.9c2b.js" in url for url in urls), urls)
-        self.assertTrue(any("chunk-vendors" in url for url in urls), urls)
+        self.assertTrue(any("index-Dl-CRwBR.js" in url for url in urls), urls)
+        self.assertTrue(any("vendor-8b21c0.js" in url for url in urls), urls)
         # Somebody else's CDN is not this box's API.
         self.assertFalse(any("example.invalid" in url for url in urls), urls)
 
+    def test_it_follows_the_chunks_those_scripts_load(self):
+        """Half the endpoints live in a lazily imported chunk the page never names."""
+        urls = [asset["url"] for asset in self.found["assets"]]
+        self.assertTrue(any("detail-3a1f77.js" in url for url in urls), urls)
+        self.assertIn("/api/v1/network/hosts", self.found["mentioned"])
+
     def test_it_pulls_the_endpoints_out_of_them(self):
         mentioned = self.found["mentioned"]
-        for path in ("/api/v1/session", "/api/v1/system/deviceinfo", "/api/v1/network/hosts",
-                     "/data/status.json", "/ws/events"):
+        for path in ("/api/v1/session", "/cgi/json-req", "/data/status.json", "/ws"):
             self.assertIn(path, mentioned)
-        self.assertNotIn("not/a/path", mentioned)  # relative, and not an endpoint
+        # The interesting one is never written whole: the app joins it together.
+        self.assertIn("system/deviceinfo", mentioned)
+        self.assertIn("v1/", mentioned)
+        self.assertNotIn("application/json", mentioned)  # a MIME type is not a path
+        self.assertNotIn("/assets/logo.svg", mentioned)  # nor is a picture
+
+    def test_it_puts_the_pieces_back_together(self):
+        """No string in that bundle spells the endpoint out; joining does."""
+        self.assertIn("/api/v1/system/deviceinfo", self.found["rebuilt"])
+
+    def test_it_quotes_the_code_that_builds_the_requests(self):
+        """A joined URL can only be understood by reading the joining."""
+        snippets = " || ".join(self.found["snippets"])
+        self.assertIn("fetch(", snippets)
+        self.assertIn("new WebSocket", snippets)
+        self.assertIn("system/deviceinfo", snippets)
 
     def test_it_then_asks_for_what_it_found(self):
         answered = {item["path"]: item for item in self.found["discovered"] if item["status"] == 200}
@@ -434,16 +478,31 @@ class InternetBoxProbeTests(unittest.TestCase):
         self.assertTrue(answered["/api/v1/system/deviceinfo"]["json"])
         self.assertIn("PRV65AX", answered["/api/v1/system/deviceinfo"]["sample"])
 
+    def test_a_route_that_drops_a_post_is_offered_a_handshake(self):
+        """A reset is not a dead end: /ws refuses a POST and takes an upgrade."""
+        by_path = {item["path"]: item for item in self.found["candidates"]}
+        self.assertFalse(by_path["/ws"]["reached"])  # the POST got nothing
+        sockets = {item["path"]: item for item in self.found["sockets"]}
+        self.assertEqual(sockets["/ws"]["status"], 101)
+        self.assertTrue(any("websocket" in header.lower() for header in sockets["/ws"]["headers"]))
+
+    def test_the_control_says_what_a_missing_path_looks_like(self):
+        """Without this, a 404 could mean anything."""
+        controls = {(item["method"], item["reached"]): item for item in self.found["controls"]}
+        self.assertEqual([item["status"] for item in self.found["controls"]], [404, 404])
+        self.assertTrue(all(reached for _method, reached in controls))
+
     def test_the_old_shapes_are_reported_as_missing_not_as_working(self):
         by_path = {item["path"]: item for item in self.found["candidates"]}
         self.assertEqual(by_path["/api/v1/general/deviceinfo"]["status"], 404)
-        self.assertEqual(by_path["/ws"]["status"], 404)
 
     def test_the_report_is_readable_and_complete(self):
         text = swisscom.report(self.found)
         self.assertIn("Internet-Box", text)
         self.assertIn("/api/v1/system/deviceinfo", text)
-        self.assertIn("scripts read: 2", text)
+        self.assertIn("scripts read: 3", text)
+        self.assertIn("HTTP 101", text)
+        self.assertIn("v1/system/deviceinfo", text)
         self.assertIn("Paste this back", text)
 
 

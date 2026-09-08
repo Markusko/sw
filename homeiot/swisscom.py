@@ -13,6 +13,18 @@ somewhere, and that somewhere is its JavaScript.
 
     python3 -m homeiot --probe-box 10.0.0.1
 
+Reading a bundler's output takes more than looking for ``"/api/..."``: a
+modern build joins a base onto a relative path, so this collects every
+string that could be part of a URL and, more usefully, quotes the code
+around each ``fetch`` and ``new WebSocket`` so the joining itself is visible.
+
+Two answers here are not failures but findings.  A path that resets the
+connection while every unknown path returns a tidy 404 is a path something
+is listening on -- ``/ws`` behaves exactly as a WebSocket route does when
+sent a plain POST -- so the prober offers it a real WebSocket handshake, and
+asks for a path that certainly does not exist as a control, to tell a
+route's refusal apart from the server's general dislike of a method.
+
 Everything it finds is printed. That output is what the rest of this
 integration should be written against.
 
@@ -22,7 +34,10 @@ repeaters; it needs credentials this cannot obtain, so it is left alone.
 
 from __future__ import annotations
 
+import base64
+import os
 import re
+import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -34,7 +49,7 @@ SOURCE = "swisscom"
 TIMEOUT = 5.0
 DEFAULT_ADDRESS = "192.168.1.1"
 ASSET_LIMIT = 20  # scripts to follow; a router's web app is not large
-ASSET_BYTES = 3_000_000
+ASSET_BYTES = 4_000_000
 
 # Paths worth trying directly.  The first three are what older Swisscom boxes
 # answered; the rest are the shapes Arcadyan firmware tends to use.
@@ -54,13 +69,43 @@ CANDIDATES: tuple[tuple[str, str, Any], ...] = (
     ("GET", "/api/v1/login", None),
 )
 
+# A path that cannot exist, asked for both ways: its answer is the baseline
+# every other answer is read against.
+CONTROLS: tuple[tuple[str, str, Any], ...] = (
+    ("GET", "/homeiot-probe-no-such-path", None),
+    ("POST", "/homeiot-probe-no-such-path", {"probe": True}),
+)
+
 FINGERPRINTS = ("internet-box", "internetbox", "swisscom", "arcadyan")
 
-# What an endpoint looks like inside a bundle: a quoted absolute path, and the
-# API-ish prefixes worth reporting.
-PATH_PATTERN = re.compile(r"""['"`](/(?:api|ws|data|sysbus|cgi|rest|graphql|v1|json)[^'"`\s]{0,120})['"`]""")
+# Every quoted string in a bundle, then judged rather than matched: a build
+# tool joins a base onto a relative path, so requiring a leading `/api` finds
+# nothing on a box that works perfectly well.
+STRING_PATTERN = re.compile(r"""['"`]([^'"`\\\r\n]{2,160})['"`]""")
 ASSET_PATTERN = re.compile(r"""(?:src|href)\s*=\s*['"]([^'"]+\.(?:js|mjs))['"]""", re.IGNORECASE)
+CHUNK_PATTERN = re.compile(r"""['"]([^'"\s]{1,120}\.m?js)['"]""")
 TITLE_PATTERN = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+ABSOLUTE_PATH = re.compile(r"/[A-Za-z0-9_.\-/:{}$%~+]*(?:\?[A-Za-z0-9_.\-/:{}$%=&]*)?")
+# A trailing slash matters: `"v1/"` is a fragment waiting to be joined, and
+# dropping it loses the middle of every URL the app builds.
+RELATIVE_PATH = re.compile(r"[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-:{}$%~+]+)*/?")
+
+# Words that mark a string as worth putting at the top of the list.
+API_WORDS = (
+    "api", "ws", "rpc", "sysbus", "sah", "nemo", "cgi", "rest", "graphql", "json", "data",
+    "auth", "login", "logout", "session", "token", "user", "password",
+    "device", "system", "status", "info", "config", "setting", "state",
+    "network", "wan", "lan", "wifi", "wlan", "dhcp", "topology", "host", "port",
+    "firewall", "guest", "voip", "phone", "usb", "reboot", "diagnostic",
+)
+ASSET_SUFFIXES = (".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", ".ico",
+                  ".woff", ".woff2", ".ttf", ".eot", ".map", ".html", ".htm", ".txt")
+MIME_HEADS = ("text", "image", "application", "audio", "video", "font", "multipart", "model", "message")
+
+# Where a bundle actually names its endpoints: at the call site.
+CALL_MARKERS = ("fetch(", "new WebSocket", "WebSocket(", "EventSource(", "XMLHttpRequest",
+                '.open("', ".open('", "baseURL", "axios", "basePath", "apiUrl", "API_URL")
 
 
 class SwisscomError(Exception):
@@ -113,13 +158,149 @@ def assets_of(ip: str, timeout: float = TIMEOUT) -> list[str]:
     return list(dict.fromkeys(found))[:ASSET_LIMIT]
 
 
+def looks_like_path(text: str) -> bool:
+    """Could this string be part of a URL the app requests?
+
+    Judged, not matched: absolute paths are obvious, but a bundle more often
+    holds the tail of one (``v1/system/deviceinfo``) to be joined onto a base.
+    Both are wanted; MIME types, file names and CSS fragments are not.
+    """
+    if not text or any(space in text for space in " \t<>()[]{}|"):
+        return False
+    if text.lower().endswith(ASSET_SUFFIXES):
+        return False
+    if text.startswith("//"):  # protocol-relative, or a stripped comment
+        return False
+    if text.startswith("/"):
+        return len(text) > 1 and ABSOLUTE_PATH.fullmatch(text) is not None
+    if "/" not in text or text.split("/")[0].lower() in MIME_HEADS:
+        return False
+    return RELATIVE_PATH.fullmatch(text) is not None
+
+
+def _api_ish(path: str) -> bool:
+    words = re.split(r"[^a-z0-9]+", path.lower())
+    return any(word in API_WORDS for word in words)
+
+
 def endpoints_in(sources: list[str]) -> list[str]:
-    """Every absolute, API-shaped path mentioned in those scripts."""
+    """Every string in those scripts that could be a request path.
+
+    Ordered so the report reads usefully: absolute before relative, and the
+    ones naming something an API would name before the rest.
+    """
     seen: dict[str, None] = {}
     for text in sources:
-        for path in PATH_PATTERN.findall(text[:ASSET_BYTES]):
-            seen.setdefault(path.split("?")[0], None)
-    return list(seen)
+        for found in STRING_PATTERN.findall(text[:ASSET_BYTES]):
+            candidate = found.strip()
+            if looks_like_path(candidate):
+                seen.setdefault(candidate, None)
+    ranked = sorted(seen, key=lambda path: (not _api_ish(path), not path.startswith("/"),
+                                            len(path), path))
+    return ranked
+
+
+def joined(mentioned: list[str], limit: int = 40) -> list[str]:
+    """Put the pieces back together.
+
+    ``fetch("/api/"+V+"system/deviceinfo")`` leaves three strings in the
+    bundle and no whole URL anywhere.  Asking for each fragment finds
+    nothing; asking for the plausible joins finds the API.
+    """
+    absolute = [path for path in mentioned if path.startswith("/")]
+    relative = [path for path in mentioned if not path.startswith("/")]
+    bases = [path for path in absolute if path.endswith("/")][:6]
+    middles = [path for path in relative if path.endswith("/")][:4]
+    tails = [path for path in relative if not path.endswith("/") and _api_ish(path)][:24]
+
+    known = set(absolute)
+    built: dict[str, None] = {}
+    for base in [*bases, "/"]:
+        for tail in tails:
+            built.setdefault(base + tail, None)
+            for middle in middles:
+                built.setdefault(base + middle + tail, None)
+    fresh = [path for path in built if path not in known]
+    return sorted(fresh, key=lambda path: (path.count("/"), len(path)))[:limit]
+
+
+def _occurrences(text: str, marker: str, most: int) -> list[int]:
+    found, at = [], text.find(marker)
+    while at >= 0 and len(found) < most:
+        found.append(at)
+        at = text.find(marker, at + len(marker))
+    return found
+
+
+def snippets_in(sources: list[str], limit: int = 18, apart: int = 150) -> list[str]:
+    """The code around each network call, so the URL joining is visible.
+
+    Minified, but a minifier keeps the strings: seeing ``fetch(x+"v1/status")``
+    says more about the API than any list of paths can.  Calls sitting close
+    together share one window rather than printing the same code five times.
+    """
+    seen: dict[str, None] = {}
+    for text in sources:
+        body = text[:ASSET_BYTES]
+        spots = sorted({at for marker in CALL_MARKERS for at in _occurrences(body, marker, 8)})
+        last = -apart
+        for at in spots:
+            if at - last < apart or len(seen) >= limit:
+                continue
+            last = at
+            seen.setdefault(" ".join(body[max(0, at - 80):at + 190].split()), None)
+    return list(seen)[:limit]
+
+
+def chunks_in(ip: str, sources: list[str], known: list[str]) -> list[str]:
+    """Scripts the bundle loads for itself, which the page never mentions."""
+    already = set(known)
+    found: dict[str, None] = {}
+    for text in sources:
+        for reference in CHUNK_PATTERN.findall(text[:ASSET_BYTES]):
+            if reference.startswith(("http://", "https://")):
+                continue
+            url = urljoin(f"http://{ip}/", reference.lstrip("./"))
+            if url not in already:
+                found.setdefault(url, None)
+    return list(found)[:ASSET_LIMIT]
+
+
+def websocket_probe(ip: str, path: str = "/ws", timeout: float = TIMEOUT) -> dict[str, Any]:
+    """Offer a real handshake, since a POST is not what that route wants.
+
+    HTTP 101 means the API is a socket and the whole integration changes
+    shape; anything else is still an answer worth reading.
+    """
+    host, _, port = ip.partition(":")
+    handshake = "\r\n".join((
+        f"GET {path} HTTP/1.1",
+        f"Host: {ip}",
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        f"Sec-WebSocket-Key: {base64.b64encode(os.urandom(16)).decode()}",
+        "Sec-WebSocket-Version: 13",
+        f"Origin: http://{ip}",
+        "", "",
+    )).encode()
+    try:
+        with socket.create_connection((host, int(port or 80)), timeout=timeout) as link:
+            link.sendall(handshake)
+            answer = link.recv(4096).decode("utf-8", "replace")
+    except (OSError, ValueError) as error:
+        return {"path": path, "status": None, "why": str(error), "headers": []}
+    head = answer.split("\r\n\r\n")[0].splitlines()
+    first = head[0].split() if head else []
+    status = int(first[1]) if len(first) > 1 and first[1].isdigit() else None
+    return {"path": path, "status": status, "why": "" if head else "closed without answering",
+            "headers": [line for line in head[:14] if line.strip()]}
+
+
+def socket_paths(mentioned: list[str]) -> list[str]:
+    """/ws first, then anything in the app that reads like a socket route."""
+    likely = [path for path in mentioned
+              if path.startswith("/") and re.search(r"(^/ws$|/ws/|socket|stream|events?$)", path.lower())]
+    return list(dict.fromkeys(["/ws", *likely]))[:5]
 
 
 def read_assets(urls: list[str], timeout: float = TIMEOUT) -> list[dict[str, Any]]:
@@ -142,30 +323,49 @@ def survey(ip: str = DEFAULT_ADDRESS, timeout: float = TIMEOUT) -> dict[str, Any
         for result in _in_parallel(ip, CANDIDATES, timeout)
     ]
 
+    controls = [{**result, "sample": _sample(result.get("body"))}
+                for result in _in_parallel(ip, CONTROLS, timeout)]
+
+    # The page's own scripts, then the scripts those load for themselves: a
+    # bundler splits the app, and the split-off half is where the API often is.
     assets = assets_of(ip, timeout)
     fetched = read_assets(assets, timeout)
-    mentioned = endpoints_in([_text(item.get("body")) for item in fetched])
+    bodies = [_text(item.get("body")) for item in fetched]
+    extra = chunks_in(ip, bodies, assets)
+    if extra:
+        fetched += read_assets(extra, timeout)
+        bodies = [_text(item.get("body")) for item in fetched]
+
+    mentioned = endpoints_in(bodies)
+    snippets = snippets_in(bodies)
+    sockets = [websocket_probe(ip, path, min(timeout, 3.0)) for path in socket_paths(mentioned)]
 
     # Whatever the app names, ask for it: that is the point of reading the app.
     # A path already tried above is not asked for twice -- its answer is reused,
     # so this section is the complete picture of what the app calls.
     already = {result["path"]: result for result in tried}
-    fresh = [("GET", path, None) for path in mentioned if path not in already][:25]
+    rebuilt = joined(mentioned)
+    askable = [path for path in mentioned if path.startswith("/") and _api_ish(path)] + rebuilt
+    fresh = [("GET", path, None) for path in askable if path not in already][:70]
     asked = [
         {**result, "json": isinstance(result.get("body"), dict), "sample": _sample(result.get("body"))}
         for result in _in_parallel(ip, fresh, timeout)
     ]
     by_path = {**{item["path"]: item for item in asked}, **already}
-    discovered = [by_path[path] for path in mentioned if path in by_path]
+    discovered = [by_path[path] for path in askable if path in by_path]
 
     return {
         "address": ip,
         "title": title,
         "reachable": root["reached"],
         "candidates": tried,
+        "controls": controls,
         "assets": [{"url": item["path"], "status": item["status"], "bytes": len(_text(item.get("body")))}
                    for item in fetched],
         "mentioned": mentioned,
+        "rebuilt": rebuilt,
+        "snippets": snippets,
+        "sockets": sockets,
         "discovered": discovered,
     }
 
@@ -320,28 +520,50 @@ def report(found: dict[str, Any]) -> str:
     lines.append(f"  front page: {'answered' if found['reachable'] else 'no answer'}"
                  + (f", titled {found['title']!r}" if found["title"] else ""))
 
+    lines += ["", "  control (this path certainly does not exist — every other",
+              "  answer means whatever differs from these two):"]
+    for item in found.get("controls", []):
+        lines.append(f"    {_answer_line(item)}")
+
     lines += ["", "  known paths:"]
     for item in found["candidates"]:
-        if not item["reached"]:
-            lines.append(f"    {item['method']:<5} {item['path']:<32} no answer"
-                         + (f" ({item.get('why', '')[:60]})" if item.get("why") else ""))
-            continue
-        marks = " ".join(filter(None, ["JSON" if item["json"] else "",
-                                       "names itself" if item.get("names_itself") else ""]))
-        lines.append(f"    {item['method']:<5} {item['path']:<32} HTTP {item['status']} {marks}")
-        if item["status"] and item["status"] < 400 and item["sample"]:
+        marks = "" if not item["reached"] else " ".join(filter(None, [
+            "JSON" if item["json"] else "", "names itself" if item.get("names_itself") else ""]))
+        lines.append(f"    {_answer_line(item)} {marks}".rstrip())
+        if item["reached"] and item["status"] and item["status"] < 400 and item["sample"]:
             lines.append(f"          {item['sample'][:160]}")
+
+    lines += ["", "  websocket handshake (a route that resets a POST but takes an",
+              "  upgrade is the API, not a dead end):"]
+    for item in found.get("sockets", []):
+        lines.append(f"    {item['path']:<24} "
+                     + (f"HTTP {item['status']}" if item["status"] else f"no answer ({item['why'][:60]})"))
+        for header in item["headers"][1:]:
+            lines.append(f"          {header[:120]}")
 
     lines += ["", f"  scripts read: {len(found['assets'])}"]
     for asset in found["assets"]:
         lines.append(f"    {asset['status']} {asset['bytes']:>8} bytes  {asset['url']}")
 
-    lines += ["", f"  paths named inside those scripts: {len(found['mentioned'])}"]
-    for path in found["mentioned"][:60]:
+    snippets = found.get("snippets", [])
+    lines += ["", f"  how the app builds its requests ({len(snippets)} call sites):"]
+    for snippet in snippets:
+        lines.append(f"    …{snippet[:230]}…")
+
+    mentioned = found["mentioned"]
+    lines += ["", f"  strings in those scripts that could be paths: {len(mentioned)}"]
+    for path in mentioned[:80]:
+        lines.append(f"    {path}")
+    if len(mentioned) > 80:
+        lines.append(f"    … and {len(mentioned) - 80} more")
+
+    rebuilt = found.get("rebuilt", [])
+    lines += ["", f"  paths rebuilt from pieces the app joins: {len(rebuilt)}"]
+    for path in rebuilt[:30]:
         lines.append(f"    {path}")
 
     answered = [item for item in found["discovered"] if item["reached"] and item["status"] and item["status"] < 400]
-    lines += ["", f"  of those, {len(answered)} answered:"]
+    lines += ["", f"  of the API-shaped ones asked for, {len(answered)} answered:"]
     for item in answered:
         lines.append(f"    HTTP {item['status']} {'JSON' if item['json'] else '    '} {item['path']}")
         if item["sample"]:
@@ -349,3 +571,11 @@ def report(found: dict[str, Any]) -> str:
 
     lines += ["", "Paste this back and the integration can be written against it."]
     return "\n".join(lines)
+
+
+def _answer_line(item: dict[str, Any]) -> str:
+    """One request, one line, the same shape everywhere in the report."""
+    if not item["reached"]:
+        why = item.get("why", "") or "no answer"
+        return f"{item['method']:<5} {item['path']:<32} no answer ({why[:60]})"
+    return f"{item['method']:<5} {item['path']:<32} HTTP {item['status']}"
