@@ -567,9 +567,19 @@ SYSBUS_COOKIES = ("deviceid/sessid=cookie-xyz", "sah/context=ctx-cookie")
 SYSBUS_COOKIE = "; ".join(SYSBUS_COOKIES)
 
 
+# Ten seconds apart, as the box logs them: 12.5 MB down and 1.25 MB up in
+# that time, which is 10 Mbps and 1 Mbps.
+SYSBUS_SAMPLES = [
+    {"Timestamp": 1_700_000_000, "RxBytes": 1_000_000_000, "TxBytes": 500_000_000},
+    {"Timestamp": 1_700_000_010, "RxBytes": 1_012_500_000, "TxBytes": 501_250_000},
+]
+
+
 class SysbusHandler(BaseHTTPRequestHandler):
     logins = 0             # how many times a client logged in
+    logs = 0               # how many times the traffic log was fetched
     context = SYSBUS_CONTEXT  # what the box currently accepts; rotate to expire
+    samples = SYSBUS_SAMPLES
 
     def log_message(self, *_args):
         pass
@@ -607,6 +617,21 @@ class SysbusHandler(BaseHTTPRequestHandler):
 
         if self.path == "/sysbus/NMC:get" and sah:
             return self._json(200, {"status": {"ActiveWANInterface": "XGS-PON", "ProvisioningState": "done"}})
+
+        if self.path == "/sysbus/Devices/Device/HGW:getEventLog" and sah:
+            if not authed:
+                return self._json(401, {"errors": [{"error": 13, "description": "Permission denied"}]})
+            SysbusHandler.logs += 1
+            return self._json(200, {"status": SysbusHandler.samples})
+
+        if self.path == "/sysbus/NeMo/Intf/veip0:getMIBs" and sah:
+            if not authed:
+                return self._json(401, {"errors": [{"error": 13, "description": "Permission denied"}]})
+            return self._json(200, {"status": {"gpon": {"veip0": {
+                # Tenths, as this family reports them.
+                "SignalRxPower": -182, "SignalTxPower": 25, "Temperature": 441,
+                "MaxBitRateSupported": 10_000_000,  # kbit/s
+            }}}})
 
         # /sysbus/Devices:get is deliberately NOT handled: the real box
         # answers "Permission denied" to it regardless of session, and this
@@ -649,8 +674,11 @@ class SwisscomSysbusTests(unittest.TestCase):
         # Sessions outlive a single read by design, so each test starts from
         # a box nobody has logged into yet.
         swisscom._SESSIONS.clear()
+        swisscom._SLOW.clear()
         SysbusHandler.logins = 0
+        SysbusHandler.logs = 0
         SysbusHandler.context = SYSBUS_CONTEXT
+        SysbusHandler.samples = SYSBUS_SAMPLES
 
     def test_both_cookies_go_back_not_just_the_last_one(self):
         """The fake box refuses a client that kept only one of them."""
@@ -708,6 +736,69 @@ class SwisscomSysbusTests(unittest.TestCase):
         self.assertEqual(values["Devices on the network"], "2")
         self.assertIn("XGS-PON", values["WAN"])
         self.assertEqual(built["note"], "")  # nothing left to explain once signed in
+
+    def test_wan_speed_is_the_difference_between_two_counters(self):
+        raw = swisscom.snapshot({"ip": self.address, "password": SYSBUS_PASSWORD})
+        self.assertAlmostEqual(raw["throughput"]["down"], 10.0, places=3)
+        self.assertAlmostEqual(raw["throughput"]["up"], 1.0, places=3)
+
+    def test_the_line_is_read_in_the_units_a_person_uses(self):
+        raw = swisscom.snapshot({"ip": self.address, "password": SYSBUS_PASSWORD})
+        line = raw["line"]
+        self.assertAlmostEqual(line["rx_dbm"], -18.2)   # -182 tenths of a dBm
+        self.assertAlmostEqual(line["tx_dbm"], 2.5)     # +25 tenths, not +25 dBm
+        self.assertAlmostEqual(line["celsius"], 44.1)
+        self.assertEqual(line["rate_mbps"], 10_000)     # 10 Gbit/s, given in kbit/s
+
+    def test_the_wan_readings_reach_the_card(self):
+        device = {"id": "swisscom-x", "ip": self.address, "name": "Internet-Box",
+                  "password": SYSBUS_PASSWORD, "source": "swisscom"}
+        raw = swisscom.snapshot(device)
+        built = swisscom.home(device, raw)["devices"][0]
+        values = {reading["label"]: reading["display"] for reading in built["readings"]}
+        self.assertEqual(values["Download"], "10.0 Mbps")
+        self.assertEqual(values["Upload"], "1.0 Mbps")
+        self.assertEqual(values["Optical RX"], "-18.2 dBm")
+        self.assertEqual(values["Line rate"], "10.0 Gbps")
+
+    def test_each_value_is_its_own_kind_so_a_room_can_pin_one(self):
+        """resolve_readouts takes the first reading of a kind: sharing one
+        would make a pinned Upload show the Download."""
+        device = {"id": "swisscom-x", "ip": self.address, "name": "Internet-Box",
+                  "password": SYSBUS_PASSWORD, "source": "swisscom"}
+        built = swisscom.home(device, swisscom.snapshot(device))["devices"][0]
+        kinds = [reading["kind"] for reading in built["readings"]]
+        self.assertEqual(len(kinds), len(set(kinds)), kinds)
+
+    def test_the_traffic_log_is_not_fetched_on_every_poll(self):
+        for _ in range(3):
+            swisscom.snapshot({"ip": self.address, "password": SYSBUS_PASSWORD})
+        self.assertEqual(SysbusHandler.logs, 1)
+
+    def test_a_counter_that_restarted_reads_as_unknown_not_as_a_speed(self):
+        SysbusHandler.samples = [
+            {"Timestamp": 1_700_000_000, "RxBytes": 9_000_000_000, "TxBytes": 8_000_000_000},
+            {"Timestamp": 1_700_000_010, "RxBytes": 12_500_000, "TxBytes": 1_250_000},
+        ]
+        device = {"id": "swisscom-x", "ip": self.address, "name": "Internet-Box",
+                  "password": SYSBUS_PASSWORD, "source": "swisscom"}
+        raw = swisscom.snapshot(device)
+        self.assertFalse(raw["throughput"]["valid"])
+        self.assertIn("restarted", raw["throughput"]["why"])
+        shown = {item["label"]: item for item in swisscom.home(device, raw)["devices"][0]["readings"]}
+        self.assertEqual(shown["Download"]["display"], "—")
+        self.assertFalse(shown["Download"]["valid"])
+
+    def test_a_log_it_cannot_read_is_admitted_rather_than_averaged(self):
+        SysbusHandler.samples = [{"Something": "else"}, {"Another": "shape"}]
+        raw = swisscom.snapshot({"ip": self.address, "password": SYSBUS_PASSWORD})
+        self.assertFalse(raw["throughput"]["valid"])
+        self.assertIn("two samples", raw["throughput"]["why"])
+
+    def test_without_a_password_there_is_no_wan_reading_at_all(self):
+        raw = swisscom.snapshot({"ip": self.address, "password": ""})
+        self.assertEqual(raw["throughput"], {})
+        self.assertEqual(SysbusHandler.logs, 0)
 
     def test_an_unreachable_box_raises_rather_than_faking_a_reading(self):
         with self.assertRaises(swisscom.SwisscomError):

@@ -563,6 +563,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scan", action="store_true", help="print every IoT host found on the LAN and exit")
     parser.add_argument("--probe-box", metavar="ADDRESS", nargs="?", const="192.168.1.1",
                         help="ask a Swisscom Internet-Box what its local API answers, and exit")
+    parser.add_argument("--probe-wan", metavar="ADDRESS", nargs="?", const="auto",
+                        help="print the Internet-Box's raw WAN traffic and optical readings, and exit")
+    parser.add_argument("--box-password", default="", metavar="PASSWORD",
+                        help="the Internet-Box password, for --probe-wan (it is not stored)")
     arguments = parser.parse_args(argv)
 
     if arguments.discover:
@@ -588,6 +592,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"reading {address} — this follows the box's own web app and then asks it "
               "about everything that app names, so give it up to a minute\n")
         print(swisscom.report(swisscom.survey(address)))
+        return 0
+
+    if arguments.probe_wan:
+        from . import store, swisscom
+
+        address = arguments.probe_wan
+        if address is True or address == "auto":
+            address = swisscom.gateway_candidates()[0]
+        # The password may already be stored, in which case it need not be
+        # typed on a command line where the shell would remember it.
+        stored = next((bridge.get("password", "") for bridge in store.load().get("bridges", [])
+                       if bridge.get("source") == swisscom.SOURCE and bridge.get("ip") == address), "")
+        print(swisscom.wan_report(address, arguments.box_password or stored))
         return 0
 
     serve(arguments.host, arguments.port, arguments.demo, arguments.token, arguments.verbose)

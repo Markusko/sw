@@ -65,6 +65,7 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
@@ -128,6 +129,15 @@ DEVICE_QUERY = {"expression": "lan and not self and not interface", "flags": "no
 # rendered into a snapshot, an error or a log.
 _SESSIONS: dict[tuple[str, str], dict[str, str]] = {}
 _SESSION_LOCK = threading.Lock()
+
+# The WAN side.  The box logs its own traffic counters about every ten
+# seconds, so these are read on a slow timer of their own rather than on the
+# dashboard's four-second poll.
+WAN_INTERFACE = "veip0"  # the fibre WAN on an IB4; XGS-PON sits behind it
+LOG_METHOD = "getEventLog"
+LOG_TYPE = "network_xt"
+SLOW_TTL = 30.0
+_SLOW: dict[Any, tuple[float, Any]] = {}
 
 # Every quoted string in a bundle, then judged rather than matched: a build
 # tool joins a base onto a relative path, so requiring a leading `/api` finds
@@ -790,8 +800,14 @@ def snapshot(device: dict[str, Any]) -> dict[str, Any]:
     wan = _sysbus(ip, "NMC:get")
     wan = wan if isinstance(wan, dict) else {}
     detail = _read_with_password(device) if device.get("password") else {}
+    # Both of these are gated, and both are slower-moving than the poll.
+    session = _session(ip, device["password"]) if detail.get("authenticated") else {}
+    metrics = (_cached(("wan", ip), SLOW_TTL, lambda: wan_metrics(ip, session))
+               if session else {})
     return {
         "reachable": True,
+        "throughput": metrics.get("throughput", {}),
+        "line": metrics.get("line", {}),
         "manufacturer": info.get("Manufacturer", ""),
         "model": info.get("ModelName", ""),
         "serial": info.get("SerialNumber", ""),
@@ -802,6 +818,195 @@ def snapshot(device: dict[str, Any]) -> dict[str, Any]:
         "detail": detail,
         "seen": time.time(),
     }
+
+
+def _cached(key: Any, ttl: float, produce: Any) -> Any:
+    """Hold a slow reading for a while, since the poll is faster than the data.
+
+    The box samples its own traffic counters about every ten seconds, so
+    asking on the four-second poll fetches a hundred-entry log to learn
+    nothing new, once per watching browser.
+    """
+    now = time.time()
+    with _SESSION_LOCK:
+        held = _SLOW.get(key)
+    if held and now - held[0] < ttl:
+        return held[1]
+    made = produce()
+    with _SESSION_LOCK:
+        _SLOW[key] = (now, made)
+    return made
+
+
+def _flat(mapping: Any) -> dict[str, Any]:
+    """Keys stripped to letters and digits, so spelling stops mattering."""
+    if not isinstance(mapping, dict):
+        return {}
+    return {re.sub(r"[^a-z0-9]", "", str(key).lower()): value for key, value in mapping.items()}
+
+
+def _pick(mapping: Any, *names: str) -> Any:
+    flat = _flat(mapping)
+    for name in names:
+        found = flat.get(re.sub(r"[^a-z0-9]", "", name.lower()))
+        if found is not None:
+            return found
+    return None
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _moment(value: Any) -> float | None:
+    """A sample's time, whether the box counts seconds or spells out a date."""
+    seconds = _number(value)
+    if seconds is not None:
+        return seconds / 1000 if seconds > 1e11 else seconds  # milliseconds happen
+    if not isinstance(value, str):
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
+def samples_in(log: Any) -> list[tuple[float, float, float]]:
+    """(when, bytes in, bytes out) for every entry that carries all three.
+
+    The exact spelling of these fields is the box's business and has not been
+    seen here for every firmware, so each is looked up under the names this
+    family uses rather than one assumed key.  An entry missing any of them is
+    dropped instead of guessed at.
+    """
+    entries = log if isinstance(log, list) else (log or {}).get("status") if isinstance(log, dict) else None
+    found = []
+    for entry in entries or []:
+        when = _moment(_pick(entry, "Timestamp", "Time", "Date", "Epoch", "SampleTime"))
+        received = _number(_pick(entry, "RxBytes", "BytesReceived", "RxBytesCounter",
+                                 "Rx", "DownstreamBytes"))
+        sent = _number(_pick(entry, "TxBytes", "BytesSent", "TxBytesCounter",
+                             "Tx", "UpstreamBytes"))
+        if when is not None and received is not None and sent is not None:
+            found.append((when, received, sent))
+    return sorted(found)
+
+
+def throughput_from(samples: list[tuple[float, float, float]]) -> dict[str, Any]:
+    """Bits per second between the last two samples, or a reason there are none.
+
+    These are counters, not rates: they climb until the box reboots and then
+    start again at nothing.  A drop is therefore not a negative speed, it is
+    the absence of a measurement, and it says so rather than rendering a
+    number nobody should believe.
+    """
+    if len(samples) < 2:
+        return {"valid": False, "why": "the box has not logged two samples yet"}
+    (before, rx_before, tx_before), (after, rx_after, tx_after) = samples[-2], samples[-1]
+    span = after - before
+    if span <= 0:
+        return {"valid": False, "why": "the last two samples share a timestamp"}
+    if span > 600:
+        return {"valid": False, "why": "the box stopped logging traffic"}
+    if rx_after < rx_before or tx_after < tx_before:
+        return {"valid": False, "why": "the counters restarted, so there is nothing to compare"}
+    return {
+        "valid": True,
+        "why": "",
+        "down": 8 * (rx_after - rx_before) / span / 1e6,
+        "up": 8 * (tx_after - tx_before) / span / 1e6,
+        "span": span,
+    }
+
+
+def _scaled(value: Any, plausible: float) -> float | None:
+    """One number, two units, and nothing in the reply that says which.
+
+    These MIBs report optical power and temperature either in whole units or
+    in tenths, and it differs between firmwares.  Physics decides: a value
+    past anything the hardware could mean is the tenths form -- -182 is
+    -18.2 dBm, not a signal no fibre carries; 441 is 44.1 C, not a router on
+    fire.  The limit is per field, because the plausible range is: received
+    power runs to about -40 dBm, transmitted power only to about +10, so the
+    same +25 that would be a real number for one is tenths for the other.
+    `--probe-wan` prints the raw values to check this against a real box.
+    """
+    number = _number(value)
+    if number is None:
+        return None
+    return number / 10 if abs(number) > plausible else number
+
+
+RX_LIMIT, TX_LIMIT, HEAT_LIMIT = 40.0, 10.0, 100.0
+
+
+def line_from(mibs: Any) -> dict[str, Any]:
+    """Optical power, transceiver temperature and line rate, where present."""
+    section = _pick(mibs, "gpon") if isinstance(mibs, dict) else None
+    fields = section if _pick(section, "SignalRxPower", "RxPower") is not None else None
+    if fields is None and isinstance(section, dict):
+        # Usually keyed by interface: {"gpon": {"veip0": {...}}}
+        fields = next((value for value in section.values() if isinstance(value, dict)), None)
+    if not isinstance(fields, dict):
+        return {"valid": False, "why": "the box reported no optical section"}
+    rate = _number(_pick(fields, "MaxBitRateSupported", "MaxBitRate", "DownstreamMaxRate",
+                         "MaxDownstreamRate"))
+    return {
+        "valid": True,
+        "why": "",
+        "rx_dbm": _scaled(_pick(fields, "SignalRxPower", "RxPower", "OpticalSignalLevel"), RX_LIMIT),
+        "tx_dbm": _scaled(_pick(fields, "SignalTxPower", "TxPower", "TransmitOpticalLevel"), TX_LIMIT),
+        "celsius": _scaled(_pick(fields, "Temperature", "TransceiverTemperature"), HEAT_LIMIT),
+        # Some firmwares answer in kbit/s, some in Mbit/s; a home line is not
+        # a million Mbit/s, so the larger number is the smaller unit.
+        "rate_mbps": (rate / 1000 if rate and rate > 1e6 else rate),
+    }
+
+
+def wan_metrics(ip: str, session: dict[str, str] | None = None,
+                timeout: float = TIMEOUT) -> dict[str, Any]:
+    """What the WAN interface is doing, read the way the box's own UI reads it."""
+    log = _sysbus(ip, f"Devices/Device/HGW:{LOG_METHOD}", {"type": LOG_TYPE}, session, timeout)
+    mibs = _sysbus(ip, f"NeMo/Intf/{WAN_INTERFACE}:getMIBs", {}, session, timeout)
+    return {"throughput": throughput_from(samples_in(log)), "line": line_from(mibs)}
+
+
+def wan_report(ip: str, password: str, timeout: float = TIMEOUT) -> str:
+    """The raw WAN replies, printed so the reading above can be checked.
+
+    Field names and units are read tolerantly here because they are not the
+    same on every firmware.  This prints what the box actually said next to
+    what was made of it, so a wrong guess shows up as a wrong number rather
+    than living quietly on the dashboard.
+    """
+    session = _session(ip, password, timeout) if password else {}
+    if password and not session:
+        return "the box did not accept that password, so none of this can be read"
+    log = _sysbus(ip, f"Devices/Device/HGW:{LOG_METHOD}", {"type": LOG_TYPE}, session, timeout)
+    mibs = _sysbus(ip, f"NeMo/Intf/{WAN_INTERFACE}:getMIBs", {}, session, timeout)
+    samples = samples_in(log)
+    entries = log if isinstance(log, list) else (log or {}).get("status") if isinstance(log, dict) else None
+    optical = _pick(mibs, "gpon") if isinstance(mibs, dict) else None
+
+    lines = [f"WAN probe — {ip}", "",
+             f"  traffic log: {len(entries or [])} entries, {len(samples)} of them readable"]
+    for entry in (entries or [])[:2]:
+        lines.append(f"    {json.dumps(entry)[:300]}")
+    if entries and not samples:
+        lines.append("    ^ none of these carried a time and both counters under the names"
+                     " this reads; send this back and the reader can be pinned to them")
+    lines += ["", f"  throughput now: {throughput_from(samples)}"]
+    lines += ["", "  optical section:", f"    {json.dumps(optical)[:600] if optical else 'not reported'}"]
+    lines += ["", f"  read as: {line_from(mibs)}",
+              "", "Check those numbers against the box's own status page: the units are the",
+              "one thing here that cannot be told from the reply alone."]
+    return "\n".join(lines)
 
 
 def _read_with_password(device: dict[str, Any]) -> dict[str, Any]:
@@ -833,6 +1038,57 @@ def _read_with_password(device: dict[str, Any]) -> dict[str, Any]:
     return detail
 
 
+def _reading(kind: str, label: str, value: Any, display: str, unit: str = "") -> dict[str, Any]:
+    """One reading, shown as a dash when there is no number behind it.
+
+    A pinned readout renders whatever `display` says, so an unknown value has
+    to say it plainly: a stale speed left on screen reads as a real one.
+    """
+    known = value is not None
+    return {"kind": kind, "label": label, "value": value if known else None,
+            "display": display if known else "—", "unit": unit, "valid": known}
+
+
+def _rate(mbps: float | None) -> str:
+    if mbps is None:
+        return ""
+    return f"{mbps / 1000:.1f} Gbps" if mbps >= 1000 else f"{mbps:.1f} Mbps"
+
+
+def _wan_readings(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """Speed and line quality, each its own kind so each can be pinned.
+
+    `resolve_readouts` finds a pinned value by kind and takes the first
+    match, so download and upload cannot share one: they would resolve to
+    the same reading and a room would show the wrong number.
+    """
+    speed = raw.get("throughput") or {}
+    line = raw.get("line") or {}
+    if not speed and not line:
+        return []
+    readings = []
+    if speed:
+        # Kept even when there is no number: a card that has shown a speed
+        # should say the speed is unknown rather than quietly drop the row.
+        down, up = (speed.get("down"), speed.get("up")) if speed.get("valid") else (None, None)
+        readings += [_reading("throughput_down", "Download", down, _rate(down), "Mbps"),
+                     _reading("throughput_up", "Upload", up, _rate(up), "Mbps")]
+    if line.get("valid"):
+        # These are properties of the fibre, not a live measurement: a missing
+        # one means this box does not report it, so it is left out entirely.
+        optical = [
+            ("optical_rx", "Optical RX", line.get("rx_dbm"), "dBm", "{:.1f} dBm"),
+            ("optical_tx", "Optical TX", line.get("tx_dbm"), "dBm", "{:.1f} dBm"),
+            ("line_temperature", "Transceiver", line.get("celsius"), "°C", "{:.1f} °C"),
+        ]
+        readings += [_reading(kind, label, value, shape.format(value), unit)
+                     for kind, label, value, unit, shape in optical if value is not None]
+        if line.get("rate_mbps"):
+            readings.append(_reading("line_rate", "Line rate", line["rate_mbps"],
+                                     _rate(line["rate_mbps"]), "Mbps"))
+    return readings
+
+
 def _uptime(seconds: Any) -> str:
     """``UpTime`` is whole seconds since boot; shown the way a person reads it."""
     try:
@@ -862,17 +1118,17 @@ def home(device: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
          "valid": True},
     ]
     if raw.get("model"):
-        readings.append({"kind": "info", "label": "Model", "value": raw["model"],
+        readings.append({"kind": "model", "label": "Model", "value": raw["model"],
                          "display": raw["model"], "valid": True})
     if raw.get("firmware"):
-        readings.append({"kind": "info", "label": "Firmware", "value": raw["firmware"],
+        readings.append({"kind": "firmware", "label": "Firmware", "value": raw["firmware"],
                          "display": raw["firmware"], "valid": True})
     if raw.get("serial"):
         readings.append({"kind": "serial", "label": "Serial", "value": raw["serial"],
                          "display": raw["serial"], "valid": True})
     shown_uptime = _uptime(raw.get("uptime"))
     if shown_uptime:
-        readings.append({"kind": "info", "label": "Uptime", "value": raw.get("uptime"),
+        readings.append({"kind": "uptime", "label": "Uptime", "value": raw.get("uptime"),
                          "display": shown_uptime, "valid": True})
     if raw.get("wan_interface"):
         display = raw["wan_interface"]
@@ -884,6 +1140,7 @@ def home(device: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
         readings.append({"kind": "count", "label": "Devices on the network",
                          "value": detail["device_count"], "display": str(detail["device_count"]),
                          "valid": True})
+    readings += _wan_readings(raw)
 
     note = ""
     if not device.get("password"):
