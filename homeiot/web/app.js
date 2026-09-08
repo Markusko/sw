@@ -127,6 +127,44 @@ const brightness = (target, state) => {
   });
 };
 
+const thermostatControls = (device) => {
+  const state = device.state || {};
+  const [low, high] = state.target_range || [5, 35];
+  const target = state.target ?? low;
+  return `
+    <div class="d-flex align-items-baseline gap-2">
+      <span class="fs-4 fw-semibold">${state.current === null || state.current === undefined
+        ? '—'
+        : `${state.current.toFixed(1)}°C`}</span>
+      <span class="small text-secondary">now${state.heating ? ' · heating' : ''}</span>
+    </div>
+    ${rangeInput({
+      id: device.id, action: 'target', value: target, min: low, max: high,
+      label: 'Set to', readout: `${Number(target).toFixed(1)}°C`, disabled: !state.on,
+    })}`;
+};
+
+const mediaControls = (device) => {
+  const state = device.state || {};
+  const track = state.track || {};
+  const described = [track.artist, track.title].filter(Boolean).join(' — ');
+  return `
+    ${described ? `<div class="small text-truncate">${esc(described)}</div>` : ''}
+    <div class="btn-group" role="group" aria-label="Playback">
+      <button type="button" class="btn btn-outline-secondary" data-act="media" data-command="previous"
+        data-id="${esc(device.id)}" aria-label="Previous">◀◀</button>
+      <button type="button" class="btn btn-outline-secondary" data-act="media"
+        data-command="${state.playing ? 'pause' : 'play'}" data-id="${esc(device.id)}"
+        aria-label="${state.playing ? 'Pause' : 'Play'}">${state.playing ? '❙❙' : '▶'}</button>
+      <button type="button" class="btn btn-outline-secondary" data-act="media" data-command="next"
+        data-id="${esc(device.id)}" aria-label="Next">▶▶</button>
+    </div>
+    ${rangeInput({
+      id: device.id, action: 'volume', value: state.volume ?? 0, min: 0, max: 100,
+      label: 'Volume', readout: `${state.volume ?? 0}%`,
+    })}`;
+};
+
 const openButton = (id, name) => `
   <button class="btn btn-link p-0 text-start text-body fw-semibold text-decoration-none text-truncate w-100"
     data-act="open" data-id="${esc(id)}">${esc(name)} <span class="text-secondary">›</span></button>`;
@@ -160,7 +198,14 @@ const section = (title, inner, action = '') => `
 function deviceCard(device) {
   const state = device.state || {};
   const subtitle = device.reachable === false ? 'Unreachable' : device.room_name || device.product || '';
+  // A value a control already shows is not repeated underneath it.
+  const covered = device.capabilities.includes('target_temperature')
+    ? ['temperature', 'target_temperature']
+    : device.capabilities.includes('transport')
+    ? ['now_playing']
+    : [];
   const readings = (device.readings || [])
+    .filter((reading) => !covered.includes(reading.kind))
     .map(
       (reading) => `<div class="d-flex justify-content-between small">
         <span class="text-secondary">${esc(reading.label)}</span><span>${esc(reading.display)}</span></div>`
@@ -183,9 +228,15 @@ function deviceCard(device) {
           <div class="small text-secondary text-truncate">${esc(subtitle)}</div>
         </div>
         ${battery}
-        ${device.controllable ? switchInput(device.id, state.on, device.reachable === false) : ''}
+        ${device.controllable && device.capabilities.includes('transport')
+          ? ''
+          : device.controllable
+          ? switchInput(device.id, state.on, device.reachable === false)
+          : ''}
       </div>
       ${device.capabilities.includes('dimming') ? brightness(device.id, state) : ''}
+      ${device.capabilities.includes('target_temperature') ? thermostatControls(device) : ''}
+      ${device.capabilities.includes('transport') ? mediaControls(device) : ''}
       ${readings}
     </div>`
   );
@@ -277,8 +328,12 @@ function viewDevices(snapshot) {
     ['Lights', 'light'],
     ['Plugs', 'plug'],
     ['Relays', 'relay'],
+    ['Heating', 'thermostat'],
+    ['Media', 'media'],
+    ['Appliances', 'appliance'],
     ['Sensors', 'sensor'],
     ['Switches', 'switch'],
+    ['Network', 'router'],
     ['Other', 'other'],
   ];
   return (
@@ -307,7 +362,14 @@ function viewCollections(snapshot) {
   return section('Collections', grid(snapshot.collections.map(collectionCard)), action);
 }
 
-const SOURCE_LABEL = { hue: 'Hue', shelly: 'Shelly' };
+const REACH = {
+  full: ['success', 'controllable'],
+  read: ['secondary', 'read-only'],
+  identify: ['secondary', 'listed only'],
+};
+
+const sourceLabel = (snapshot, source) =>
+  ((snapshot.sources || []).find((item) => item.source === source) || {}).label || source;
 
 function viewSettings(snapshot) {
   const bridges = snapshot.bridges
@@ -315,7 +377,7 @@ function viewSettings(snapshot) {
       (bridge) => `<li class="list-group-item d-flex align-items-center gap-3">
         <div class="min-w-0 flex-grow-1">
           <div class="fw-semibold text-truncate">${esc(bridge.name)}
-            <span class="badge text-bg-light">${esc(SOURCE_LABEL[bridge.source] || bridge.source)}</span>${
+            <span class="badge text-bg-light">${esc(sourceLabel(snapshot, bridge.source))}</span>${
         bridge.demo ? ' <span class="badge text-bg-secondary">demo</span>' : ''
       }</div>
           <div class="small text-secondary text-truncate">${esc(bridge.ip)} · ${esc(
@@ -332,12 +394,12 @@ function viewSettings(snapshot) {
       (item) => `<li class="list-group-item d-flex align-items-center gap-3">
         <div class="min-w-0 flex-grow-1">
           <div class="fw-semibold text-truncate">${esc(item.name)}
-            <span class="badge text-bg-light">${esc(SOURCE_LABEL[item.source] || item.source)}</span></div>
+            <span class="badge text-bg-light">${esc(sourceLabel(snapshot, item.source))}</span></div>
           <div class="small text-secondary">${esc(item.ip)} · ${esc(item.model || '')}</div>
         </div>
-        <button class="btn btn-sm btn-primary" data-act="${item.source === 'shelly' ? 'adopt-shelly' : 'pair'}"
-          data-ip="${esc(item.ip)}" ${item.paired ? 'disabled' : ''}>${
-        item.paired ? 'Added' : item.source === 'shelly' ? 'Add' : 'Pair'
+        <button class="btn btn-sm btn-primary" data-act="${item.source === 'hue' ? 'pair' : 'adopt'}"
+          data-ip="${esc(item.ip)}" data-source="${esc(item.source)}" ${item.paired ? 'disabled' : ''}>${
+        item.paired ? 'Added' : item.source === 'hue' ? 'Pair' : 'Add'
       }</button>
       </li>`
     )
@@ -379,24 +441,47 @@ function viewSettings(snapshot) {
         bridges || '<li class="list-group-item text-secondary">Nothing paired yet.</li>'
       }</ul>
         <div class="card-body">
-          <div class="d-flex flex-wrap gap-2">
-            <button class="btn btn-primary" data-act="find" data-source="hue" ${App.searching ? 'disabled' : ''}>${
-        App.searching === 'hue' ? 'Searching…' : 'Find Hue bridges'
-      }</button>
-            <button class="btn btn-primary" data-act="find" data-source="shelly" ${App.searching ? 'disabled' : ''}>${
-        App.searching === 'shelly' ? 'Searching…' : 'Find Shelly devices'
-      }</button>
-            <button class="btn btn-outline-secondary" data-act="add-demo">Add demo bridge</button>
-          </div>
+          ${(snapshot.sources || [])
+            .map((item) => {
+              const [tone, reach] = REACH[item.control] || REACH.read;
+              return `<div class="d-flex align-items-start gap-3 py-2 border-bottom" data-source-row="${esc(
+                item.source
+              )}">
+                <div class="min-w-0 flex-grow-1">
+                  <div class="fw-semibold">${esc(item.label)}
+                    <span class="badge text-bg-${tone}">${esc(reach)}</span>${
+                item.needs ? ` <span class="badge text-bg-warning">needs a ${esc(item.needs)}</span>` : ''
+              }</div>
+                  <div class="small text-secondary">${esc(item.note)}</div>
+                </div>
+                <button class="btn btn-sm btn-outline-primary" data-act="find" data-source="${esc(item.source)}"
+                  ${App.searching ? 'disabled' : ''}>${
+                App.searching === item.source ? 'Searching…' : 'Search'
+              }</button>
+              </div>`;
+            })
+            .join('')}
           ${found ? `<ul class="list-group mt-3">${found}</ul>` : ''}
-          <div class="input-group mt-3">
-            <input type="text" class="form-control" id="manual-ip" placeholder="Address, e.g. 192.168.1.42"
-              inputmode="decimal" />
-            <button class="btn btn-outline-secondary" data-act="pair-manual">Pair a Hue bridge</button>
-            <button class="btn btn-outline-secondary" data-act="adopt-shelly-manual">Add a Shelly</button>
+          <h3 class="h6 text-secondary text-uppercase mt-4">Add by address</h3>
+          <div class="row g-2">
+            <div class="col-12 col-md"><select class="form-select" id="manual-source" aria-label="Kind of device">
+              ${(snapshot.sources || [])
+                .map(
+                  (item, index) => `<option value="${esc(item.source)}" ${index === 0 ? 'selected' : ''}>${esc(
+                    item.label
+                  )}</option>`
+                )
+                .join('')}
+            </select></div>
+            <div class="col-12 col-md"><input type="text" class="form-control" id="manual-ip"
+              placeholder="192.168.1.42" inputmode="decimal" /></div>
+            <div class="col-12 col-md"><input type="text" class="form-control" id="manual-secret"
+              placeholder="Device key or password, if it needs one" autocomplete="off" /></div>
+            <div class="col-auto"><button class="btn btn-primary" data-act="add-by-address">Add</button></div>
           </div>
-          <p class="small text-secondary mt-2 mb-0">A Shelly needs no pairing. A Hue bridge needs its link
-            button pressed within 30 seconds.</p>
+          <p class="small text-secondary mt-2 mb-0">A Hue bridge needs its link button pressed within 30
+            seconds. A Meross needs the device key from your account; the Internet-Box needs its password.</p>
+          <div class="mt-3"><button class="btn btn-outline-secondary" data-act="add-demo">Add demo bridge</button></div>
         </div></div>`
     ),
     section(
@@ -521,11 +606,16 @@ function panelDevice(device) {
     ${device.controllable
       ? `<div class="d-flex align-items-center gap-3 mb-3">
           <span class="flex-grow-1">${esc(device.product || device.kind)}</span>
-          ${switchInput(device.id, state.on, device.reachable === false)}
+          ${device.capabilities.includes('transport')
+            ? ''
+            : switchInput(device.id, state.on, device.reachable === false)}
         </div>
         ${brightness(device.id, state)}
+        ${device.capabilities.includes('target_temperature') ? thermostatControls(device) : ''}
+        ${device.capabilities.includes('transport') ? mediaControls(device) : ''}
         ${colourControls(device.id, state, device.capabilities)}`
       : ''}
+    ${device.note ? `<div class="alert alert-secondary small">${esc(device.note)}</div>` : ''}
     ${(device.lights || []).length > 1
       ? `<h3 class="h6 text-secondary text-uppercase mt-4">Lights in this device</h3>${device.lights
           .map(
@@ -769,7 +859,11 @@ function paint(root, html) {
   morphdom(root, next, {
     childrenOnly: true,
     onBeforeElUpdated: (from, to) => {
-      if (from === holding || from === document.activeElement) return false;
+      // Only controls that hold a value are protected from being updated: a
+      // button keeps focus after a tap, and must still be allowed to change
+      // (play becomes pause the moment the speaker does).
+      const holdsValue = ['INPUT', 'SELECT', 'TEXTAREA'].includes(from.tagName);
+      if (holdsValue && (from === holding || from === document.activeElement)) return false;
       // A form the user is part-way through filling in is theirs, not the
       // server's: leave it, and its children, exactly as they left it.
       if (from.dataset && from.dataset.static !== undefined) return false;
@@ -893,6 +987,7 @@ const actions = {
   },
   open: (element) => openPanel('detail', element.dataset.id),
   scene: (element) => api('POST', `/api/scenes/${encodeURIComponent(element.dataset.id)}/recall`, {}).catch(fail),
+  media: (element) => command(element.dataset.id, { [element.dataset.command]: true }),
   colour: (element) => command(element.dataset.id, { on: true, hex: element.dataset.colour }),
   identify: (element) =>
     api('POST', `/api/devices/${encodeURIComponent(element.dataset.id)}/identify`, {})
@@ -936,13 +1031,19 @@ const actions = {
   discover: () => actions.find({ dataset: { source: 'hue' } }),
   find: (element) => {
     const source = element.dataset.source || 'hue';
+    const secret = source === 'meross' ? ($('#manual-secret')?.value || '').trim() : '';
+    if (source === 'meross' && !secret) {
+      return toast('Meross devices are only reachable with your device key — put it in the field below', true);
+    }
     App.searching = source;
     render();
-    api('POST', '/api/discover', { source, deep: true })
+    api('POST', '/api/discover', { source, deep: true, key: secret })
       .then((result) => {
         App.found = result.bridges;
         if (source === 'hue') App.discovered = result.bridges;
-        if (!result.bridges.length) toast(`No ${SOURCE_LABEL[source]} device answered on this network`, true);
+        if (!result.bridges.length) {
+          toast(`Nothing answered as ${sourceLabel(App.snapshot || {}, source)} on this network`, true);
+        }
       })
       .catch(fail)
       .finally(() => {
@@ -950,10 +1051,14 @@ const actions = {
         render();
       });
   },
-  'adopt-shelly': (element) => adoptShelly(element.dataset.ip),
-  'adopt-shelly-manual': () => {
-    const value = $('#manual-ip').value.trim();
-    if (value) adoptShelly(value);
+  adopt: (element) => adopt(element.dataset.source, element.dataset.ip, ''),
+  'add-by-address': () => {
+    const source = $('#manual-source').value;
+    const ip = $('#manual-ip').value.trim();
+    const secret = $('#manual-secret').value.trim();
+    if (!ip) return toast('An address is needed', true);
+    if (source === 'hue') return pair(ip);
+    adopt(source, ip, secret);
   },
   'add-readout': (element) => {
     const picker = $('#value-source');
@@ -1018,8 +1123,8 @@ const actions = {
   scan: () => api('POST', '/api/scan', {}).then(() => toast('Scanning…')).catch(fail),
 };
 
-function adoptShelly(ip) {
-  api('POST', '/api/shelly', { ip })
+function adopt(source, ip, secret) {
+  api('POST', '/api/adopt', { source, ip, key: secret, password: secret })
     .then((result) => {
       App.found = null;
       toast(`Added ${result.device.name}`);
@@ -1059,16 +1164,25 @@ document.addEventListener('change', (event) => {
   else if (act === 'colour-pick') command(id, { on: true, hex: element.value });
   else if (act === 'brightness') command(id, { brightness: Number(element.value) });
   else if (act === 'mirek') command(id, { mirek: Number(element.value) });
+  else if (act === 'target') command(id, { target: Number(element.value) });
+  else if (act === 'volume') command(id, { volume: Number(element.value) });
 });
 
 document.addEventListener('input', (event) => {
   const element = event.target;
   const { act, id } = element.dataset;
-  if (act !== 'brightness' && act !== 'mirek') return;
+  const streamed = { brightness: 'brightness', mirek: 'mirek', target: 'target', volume: 'volume' };
+  if (!streamed[act]) return;
   const value = Number(element.value);
+  const shown = {
+    brightness: `${value}%`,
+    mirek: `${Math.round(1000000 / value)} K`,
+    target: `${value.toFixed(1)}°C`,
+    volume: `${value}%`,
+  }[act];
   const readout = element.parentElement.querySelector('[data-role="value"]');
-  if (readout) readout.textContent = act === 'brightness' ? `${value}%` : `${Math.round(1000000 / value)} K`;
-  commandSoon(id, act === 'brightness' ? { brightness: value } : { mirek: value });
+  if (readout) readout.textContent = shown;
+  commandSoon(id, { [act]: value });
 });
 
 document.addEventListener('pointerdown', (event) => {

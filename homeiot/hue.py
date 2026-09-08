@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable
 
 from . import color, net
 
+SOURCE = "hue"
 APP_NAME = "homeiot"
 V2_TYPES = (
     "bridge",
@@ -71,6 +72,20 @@ def pair(ip: str, app_name: str = APP_NAME, instance: str = "dashboard") -> dict
             raise LinkButtonError(description or "press the link button on the bridge")
         errors.append(description or json.dumps(body)[:200])
     raise BridgeError("; ".join(errors) or f"no response from {ip}")
+
+
+def probe(ip: str, timeout: float = 2.5) -> dict[str, Any] | None:
+    """Part of the integration contract; the work lives in `discovery`."""
+    from . import discovery
+
+    found = discovery.probe_bridge(ip, timeout=timeout)
+    return {**found, "source": SOURCE} if found else None
+
+
+def discover(deep: bool = False) -> list[dict[str, Any]]:
+    from . import discovery
+
+    return [{**found, "source": SOURCE} for found in discovery.discover_hue(deep=deep)]
 
 
 def make_bridge(found: dict[str, Any], credentials: dict[str, Any]) -> dict[str, Any]:
@@ -188,6 +203,11 @@ def build_payload(command: dict[str, Any], target: dict[str, Any] | None = None)
         payload["alert"] = {"action": str(command["alert"])}
     if command.get("transition") is not None:
         payload["dynamics"] = {"duration": int(color.clamp(float(command["transition"]), 0, 60000))}
+    # Commands meant for something that is not a lamp -- a speaker's volume, a
+    # thermostat's target -- travel to their own integration untouched.
+    for key in ("volume", "mute", "play", "pause", "next", "previous", "target", "mode"):
+        if command.get(key) is not None:
+            payload[key] = command[key]
     if payload.get("on", {}).get("on") is False:
         # Colour/brightness sent alongside "off" is ignored by the bridge anyway.
         payload = {key: value for key, value in payload.items() if key in ("on", "dynamics")}

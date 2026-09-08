@@ -38,9 +38,14 @@ def request(
     payload: Any = None,
     timeout: float = TIMEOUT,
     insecure: bool = False,
+    raw_body: bytes | None = None,
 ) -> tuple[int, Any]:
-    """Perform a request and decode a JSON body when there is one."""
-    body = None if payload is None else json.dumps(payload).encode()
+    """Perform a request and decode a JSON body when there is one.
+
+    `payload` is encoded as JSON; `raw_body` is sent exactly as given, for the
+    protocols that are not JSON (SOAP, for one).
+    """
+    body = raw_body if raw_body is not None else (None if payload is None else json.dumps(payload).encode())
     all_headers = {"Accept": "application/json", **(headers or {})}
     if body is not None:
         all_headers.setdefault("Content-Type", "application/json")

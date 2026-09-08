@@ -322,6 +322,105 @@ await page.waitForTimeout(1000);
 snapshot = await state();
 check('a camera can be removed', !snapshot.cameras.some((c) => c.name === 'Garage'));
 
+// 14. the other integrations: what they control, and what they honestly do not
+await page.locator('#tabs .nav-link', { hasText: 'Devices' }).tap();
+await page.waitForTimeout(700);
+// --- Sonos: transport and volume
+const sonos = card('Kitchen speaker');
+check('the Sonos speaker has a card', (await sonos.count()) === 1);
+check('it shows what is playing', / — /.test(await sonos.textContent()),
+  (await sonos.textContent()).replace(/\s+/g, ' ').trim().slice(0, 70));
+
+snapshot = await state();
+const speakerWas = find(snapshot.devices, 'Kitchen speaker').state;
+await sonos.locator(`[data-command="${speakerWas.playing ? 'pause' : 'play'}"]`).tap();
+await page.waitForTimeout(1300);
+snapshot = await state();
+check('play and pause reach the speaker',
+  find(snapshot.devices, 'Kitchen speaker').state.playing === !speakerWas.playing,
+  `${speakerWas.playing} -> ${find(snapshot.devices, 'Kitchen speaker').state.playing}`);
+
+const trackWas = find(snapshot.devices, 'Kitchen speaker').state.track.title;
+await sonos.locator('[data-command="next"]').tap();
+await page.waitForTimeout(1300);
+snapshot = await state();
+check('skip changes the track', find(snapshot.devices, 'Kitchen speaker').state.track.title !== trackWas,
+  `${trackWas} -> ${find(snapshot.devices, 'Kitchen speaker').state.track.title}`);
+
+const volume = sonos.locator('input[data-act="volume"]');
+await volume.fill('62');
+await volume.dispatchEvent('change');
+await page.waitForTimeout(1200);
+snapshot = await state();
+check('the volume slider reaches the speaker', find(snapshot.devices, 'Kitchen speaker').state.volume === 62,
+  `volume=${find(snapshot.devices, 'Kitchen speaker').state.volume}`);
+
+// --- Meross thermostat
+const heating = card('Underfloor heating');
+check('the thermostat has a card', (await heating.count()) === 1);
+check('it shows the room temperature', /°C/.test(await heating.textContent()),
+  (await heating.textContent()).replace(/\s+/g, ' ').trim().slice(0, 70));
+
+if (!find(snapshot.devices, 'Underfloor heating').state.on) {
+  await heating.locator('input[role=switch]').tap();  // the target slider follows the power
+  await page.waitForTimeout(1300);
+}
+const target = heating.locator('input[data-act="target"]');
+await target.fill('24');
+await target.dispatchEvent('change');
+await page.waitForTimeout(1300);
+snapshot = await state();
+const thermostat = find(snapshot.devices, 'Underfloor heating');
+check('the target temperature reaches the thermostat', thermostat.state.target === 24,
+  `target=${thermostat.state.target}`);
+check('setting a temperature switches it out of the schedule', thermostat.state.mode_label === 'Manual',
+  thermostat.state.mode_label);
+
+const heatingWas = find(snapshot.devices, 'Underfloor heating').state.on;
+await heating.locator('input[role=switch]').tap();
+await page.waitForTimeout(1300);
+snapshot = await state();
+check('the thermostat switch reaches the device',
+  find(snapshot.devices, 'Underfloor heating').state.on === !heatingWas,
+  `${heatingWas} -> ${find(snapshot.devices, 'Underfloor heating').state.on}`);
+
+// --- the read-only ones say so rather than offering dead controls
+for (const [name, why] of [['Living room Shield', 'Cast'], ['Siemens Dishwasher', 'Home Connect'],
+                           ['Internet-Box', 'Swisscom']]) {
+  const item = card(name);
+  check(`${name} appears`, (await item.count()) === 1);
+  check(`${name} offers no switch it cannot honour`,
+    (await item.locator('input[role=switch]').count()) === 0);
+}
+check('the Shield shows what it is playing', /Netflix/.test(await card('Living room Shield').textContent()));
+check('the dishwasher shows its serial', /402004123456/.test(await card('Siemens Dishwasher').textContent()));
+
+// a read-only device refuses a write, with a reason
+const shield = (await state()).devices.find((d) => d.source === 'cast');
+const refused = await fetch(`${base}/api/targets/${encodeURIComponent(shield.id)}/state`, {
+  method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ on: true }),
+}).then((r) => r.json());
+check('a write to a read-only device is refused with a reason',
+  refused.ok === false && /read-only|read but not controlled/.test(JSON.stringify(refused.errors)),
+  JSON.stringify(refused.errors));
+
+// --- the panel explains the limits
+await card('Siemens Dishwasher').getByRole('button', { name: /Siemens Dishwasher/ }).tap();
+await page.waitForSelector('#panel.show');
+await page.waitForTimeout(700);
+check('the appliance panel explains what is missing',
+  /Home Connect account/.test(await page.locator('#panel-body').textContent()));
+await page.locator('#panel .btn-close').tap();
+await page.waitForTimeout(500);
+
+// --- settings lists every integration with its honest reach
+await page.locator('#tabs .nav-link', { hasText: 'Settings' }).tap();
+await page.waitForTimeout(700);
+const settings = await page.locator('#main').textContent();
+for (const label of ['Hue', 'Shelly', 'Sonos', 'Meross', 'Cast', 'Home Connect', 'Swisscom']) {
+  check(`settings mentions ${label}`, settings.includes(label));
+}
+
 console.log(errors.length ? 'CONSOLE ERRORS:\n' + errors.join('\n') : 'no console errors');
 console.log(failures ? `${failures} FAILED` : 'all checks passed');
 await browser.close();

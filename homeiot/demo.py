@@ -49,6 +49,97 @@ READOUTS = [
      "kind": "power", "room": "hue:demo0000bridge:room:room-living", "order": 2},
 ]
 
+# One of each new integration, so the cards, the controls and the honest
+# "this one is read-only" cases can all be seen without the hardware.
+FAKES = [
+    {"id": "demosonos1", "source": "sonos", "api": "demo", "fake": "sonos", "demo": True,
+     "ip": "0.0.0.0", "name": "Kitchen speaker", "model": "Sonos One", "room_name": "Kitchen",
+     "firmware": "78.1-53190"},
+    {"id": "demomts200b", "source": "meross", "api": "demo", "fake": "meross", "demo": True,
+     "ip": "0.0.0.0", "name": "Underfloor heating", "model": "mts200b", "key": "demo",
+     "firmware": "6.2.5"},
+    {"id": "demoshield1", "source": "cast", "api": "demo", "fake": "cast", "demo": True,
+     "ip": "0.0.0.0", "name": "Living room Shield", "model": "SHIELD Android TV"},
+    {"id": "demodishwasher", "source": "homeconnect", "api": "demo", "fake": "homeconnect",
+     "demo": True, "ip": "0.0.0.0", "name": "Siemens Dishwasher", "model": "SN65ZX49CE",
+     "appliance": "Dishwasher", "brand": "Siemens", "serial": "402004123456"},
+    {"id": "demohob", "source": "homeconnect", "api": "demo", "fake": "homeconnect", "demo": True,
+     "ip": "0.0.0.0", "name": "Siemens Hob", "model": "EX675LYV1E", "appliance": "Hob",
+     "brand": "Siemens", "serial": "402004654321"},
+    {"id": "demointernetbox", "source": "swisscom", "api": "demo", "fake": "swisscom", "demo": True,
+     "ip": "192.168.1.1", "name": "Internet-Box", "model": "Swisscom Internet-Box", "password": ""},
+]
+
+_TRACKS = [
+    ("Massive Attack", "Teardrop", "Mezzanine"),
+    ("Portishead", "Roads", "Dummy"),
+    ("Boards of Canada", "Roygbiv", "Music Has the Right to Children"),
+]
+
+_FAKE_STATE: dict[str, Any] = {
+    "sonos": {"transport": "PLAYING", "volume": 27, "mute": False,
+              "track": ("Massive Attack", "Teardrop", "Mezzanine")},
+    "meross": {"onoff": 1, "mode": 3, "state": 1, "currentTemp": 215, "targetTemp": 220,
+               "manualTemp": 225, "min": 50, "max": 350},
+    "cast": {"fn": "Living room Shield", "md": "SHIELD Android TV", "st": "1", "rs": "Netflix", "ve": "05"},
+}
+
+
+def _fake_raw(bridge: dict[str, Any]) -> dict[str, Any]:
+    which = bridge["fake"]
+    if which == "sonos":
+        state = _FAKE_STATE["sonos"]
+        artist, title, album = state["track"]
+        return {
+            "transport": {"CurrentTransportState": state["transport"]},
+            "position": {"TrackMetaData":
+                         '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/"'
+                         ' xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"><item>'
+                         f"<dc:title>{title}</dc:title><dc:creator>{artist}</dc:creator>"
+                         f"<upnp:album>{album}</upnp:album></item></DIDL-Lite>"},
+            "volume": {"CurrentVolume": str(state["volume"])},
+            "mute": {"CurrentMute": "1" if state["mute"] else "0"},
+        }
+    if which == "meross":
+        return {"all": {"all": {"digest": {"thermostat": {"mode": [{"channel": 0, **_FAKE_STATE["meross"]}]}}}}}
+    if which == "cast":
+        return {"txt": dict(_FAKE_STATE["cast"])}
+    if which == "homeconnect":
+        return {"txt": {"type": bridge.get("appliance", ""), "brand": bridge.get("brand", ""),
+                        "vib": bridge.get("model", ""), "serialno": bridge.get("serial", "")}}
+    return {"reachable": True, "detail": {}}
+
+
+def _fake_send(bridge: dict[str, Any], rtype: str, payload: dict[str, Any]) -> Any:
+    which = bridge["fake"]
+    if which == "sonos":
+        state = _FAKE_STATE["sonos"]
+        if payload.get("play") or (payload.get("on") or {}).get("on") is True:
+            state["transport"] = "PLAYING"
+        if payload.get("pause") or (payload.get("on") or {}).get("on") is False:
+            state["transport"] = "PAUSED_PLAYBACK"
+        if payload.get("next") or payload.get("previous"):
+            step = 1 if payload.get("next") else -1
+            index = (_TRACKS.index(state["track"]) + step) % len(_TRACKS)
+            state["track"] = _TRACKS[index]
+        if payload.get("volume") is not None:
+            state["volume"] = int(color.clamp(float(payload["volume"]), 0, 100))
+        if payload.get("mute") is not None:
+            state["mute"] = bool(payload["mute"])
+        return {"ok": True}
+    if which == "meross":
+        state = _FAKE_STATE["meross"]
+        if "on" in payload:
+            state["onoff"] = 1 if payload["on"]["on"] else 0
+        if payload.get("target") is not None:
+            state["targetTemp"] = int(round(float(payload["target"]) * 10))
+            state["manualTemp"] = state["targetTemp"]
+            state["mode"] = 4
+        state["state"] = 1 if state["onoff"] and state["targetTemp"] > state["currentTemp"] else 0
+        return {"ok": True}
+    raise KeyError(f"{bridge.get('name')} is read-only")
+
+
 BRIDGE = {
     "id": "demo0000bridge",
     "ip": "0.0.0.0",
@@ -372,6 +463,9 @@ def _xy(swatch: str) -> dict[str, float]:
 
 def snapshot(bridge: dict[str, Any]) -> dict[str, Any]:
     with _LOCK:
+        if bridge.get("fake"):
+            _tick_fakes()
+            return _fake_raw(bridge)
         if bridge.get("shelly"):
             _tick_shelly()
             return {"status": json.loads(json.dumps(_SHELLY_STATE))}
@@ -382,9 +476,22 @@ def snapshot(bridge: dict[str, Any]) -> dict[str, Any]:
 
 
 def home(bridge: dict[str, Any], raw: Any) -> dict[str, Any]:
-    from . import model, shelly
+    from . import integrations, model, shelly
 
+    if bridge.get("fake"):
+        return integrations.BY_SOURCE[bridge["source"]].home(bridge, raw)
     return shelly.home(bridge, raw) if bridge.get("shelly") else model.build_home(bridge, raw)
+
+
+def _tick_fakes() -> None:
+    """Drift the thermostat towards its target so the card visibly lives."""
+    thermostat = _FAKE_STATE["meross"]
+    if thermostat["onoff"] and thermostat["currentTemp"] < thermostat["targetTemp"]:
+        thermostat["currentTemp"] += 1
+        thermostat["state"] = 1
+    elif thermostat["currentTemp"] > thermostat["targetTemp"]:
+        thermostat["currentTemp"] -= 1
+        thermostat["state"] = 0
 
 
 def _tick_shelly() -> None:
@@ -406,6 +513,8 @@ def send(_bridge: dict[str, Any], rtype: str, rid: str, payload: dict[str, Any])
     from . import model  # local import keeps the module dependency-free at import time
 
     with _LOCK:
+        if _bridge.get("fake"):
+            return _fake_send(_bridge, rtype, payload)
         if _bridge.get("shelly"):
             switch = _SHELLY_STATE.get(f"{rtype}:{rid}")
             if switch is None:

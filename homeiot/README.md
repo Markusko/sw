@@ -1,11 +1,23 @@
 # homeiot
 
-A local dashboard for the IoT devices on your own network. It finds your
-Philips Hue bridge and your Shelly devices, shows everything it can reach with
-its live state, and lets you control what can be controlled — lamps, plugs,
-relays, rooms, zones, scenes, and your own cross-cutting **Collections**.
-Room cards can also carry the values you care about (temperature, humidity,
-power) and a camera's picture.
+A local dashboard for the IoT devices on your own network. It finds what it
+can, shows everything with its live state, and controls what can honestly be
+controlled — lamps, plugs, relays, thermostats, speakers, rooms, zones, scenes,
+and your own cross-cutting **Collections**. Room cards can also carry the
+values you care about (temperature, humidity, power) and a camera's picture.
+
+| Integration | Reach | Needs |
+| --- | --- | --- |
+| Philips Hue | full control | link button, once |
+| Shelly (Gen1 and Gen2+) | full control | — |
+| Sonos | full control | — |
+| Meross (MTS200B and friends) | full control | your account's device key |
+| Google Cast / NVIDIA Shield | read-only | — |
+| Home Connect (Siemens, Bosch) | listed only | — |
+| Swisscom Internet-Box | read-only | the box's password |
+
+Where an integration stops, the dashboard says so and offers no control it
+cannot honour. The reasons are under **What it does**.
 
 It runs on your machine, talks only to your LAN, and stores everything under
 `homeiot/data/`. No cloud account, no broker, nothing to install.
@@ -149,11 +161,52 @@ mix of devices, rooms and zones under one name, controlled together. "Evening",
 > collection". Renaming it later is a one-word change in `app.js` and the
 > `collections` key in `config.json`.
 
-**Settings** — find, add and remove Hue bridges and Shelly devices, manage
-cameras, and scan the LAN for everything else answering mDNS or SSDP: HomeKit
-accessories, Matter devices, Tasmota nodes, ESPHome, Cast targets, printers.
-Those are listed, not controlled; Hue and Shelly are the integrations that
-exist today.
+**Sonos** — every speaker's own local API on port 1400: play, pause, skip,
+volume, mute, and what is playing now. No account, no cloud, no key; found by
+SSDP. This is the most open of the lot and the integration is complete.
+
+**Meross** — the MTS200B underfloor-heating thermostat: room temperature, the
+target, whether it is calling for heat, and setting the target (which switches
+it out of its schedule, or the schedule would put it straight back). Meross
+switches and plugs come along with it. Controlled **on your own network**, not
+through their cloud — but every local request is signed with the key your
+account set when the device was paired, so that key has to be supplied once,
+from the Meross app or from your account at iot.meross.com. Meross devices do
+not announce themselves usefully, so searching for them sweeps the subnet.
+
+**Google Cast, including the NVIDIA Shield** — read-only, and deliberately so.
+A Cast device keeps its mDNS announcement current: the name, the model, whether
+an app is running and usually what it is playing. That is shown. A remote would
+need either the Cast channel protocol (protobuf over TLS) or ADB on the Shield
+with debugging enabled and a pairing dance; neither is implemented, so no
+buttons are offered that would do nothing.
+
+**Home Connect (Siemens, Bosch)** — the dishwasher and the hob are identified
+from what they announce: appliance type, brand, model number and serial.
+Programme state and remote start need the per-appliance keys that exist only
+inside your Home Connect account, or their cloud API behind OAuth and a
+developer registration. Neither can be taken from the network, so the appliance
+is listed with a note saying exactly that rather than showing empty dials.
+
+**Swisscom Internet-Box** — Swisscom does not publish this box's local API and
+it has changed between generations, so this one is written to find out rather
+than to assume. It recognises the box and, with the password, tries the login
+shapes these boxes are known to accept. Run:
+
+```
+python3 -m homeiot --probe-box 192.168.1.1
+```
+
+and it prints exactly what your box answers on each known endpoint. That output
+is what proper support should be written against; guessing past it would only
+produce a dashboard that lies. The MQTT service the box advertises is
+Swisscom's own, for their mesh repeaters, and needs credentials this cannot
+obtain.
+
+**Settings** — find, add and remove everything above, manage cameras, and scan
+the LAN for whatever else answers mDNS or SSDP: HomeKit accessories, Matter
+devices, Tasmota nodes, ESPHome, printers. Each integration is listed with what
+it can reach and what it needs from you.
 
 ## Live updates
 
@@ -197,7 +250,13 @@ homeiot/
 ├── discovery.py     mDNS, SSDP, cloud discovery, subnet sweep
 ├── color.py         xy <-> sRGB, mired <-> kelvin, gamut clamping
 ├── store.py         config.json, atomically, 0600
+├── integrations.py  the registry: which module speaks for which device
 ├── shelly.py        Shelly Gen1 and Gen2+: discovery, reading, control
+├── sonos.py         Sonos: SSDP, SOAP transport and volume
+├── meross.py        Meross local API: signed requests, MTS200B thermostat
+├── cast.py          Google Cast / NVIDIA Shield: read-only, from mDNS
+├── homeconnect.py   Siemens and Bosch appliances: identification only
+├── swisscom.py      Internet-Box: recognition, and a prober for the rest
 ├── camera.py        RTSP via ffmpeg, snapshot polling, URL masking
 ├── demo.py          a simulated bridge, Shelly and camera
 ├── web/             index.html, app.css, app.js — no build step
@@ -235,6 +294,8 @@ curl -X PUT http://localhost:8712/api/targets/hue:001788.../state \
 | POST | `/api/scenes/<id>/recall` | recall a scene |
 | POST | `/api/devices/<id>/identify` | make it blink |
 | GET/POST/PUT/DELETE | `/api/collections[/<id>]` | manage collections |
+| GET | `/api/sources` | the integrations, their reach and what they need |
+| POST | `/api/adopt` | `{"source", "ip", "key"/"password"}` — take on a device |
 | POST | `/api/shelly` | `{"ip": "..."}` — adopt a Shelly, no pairing needed |
 | GET/POST/PUT/DELETE | `/api/readouts[/<id>]` | values pinned to a room |
 | GET/POST/PUT/DELETE | `/api/cameras[/<id>]` | cameras |
@@ -273,11 +334,18 @@ else in the app skips verification.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s homeiot/tests -t .     # 53 unit tests, no network
+python3 -m unittest discover -s homeiot/tests -t .     # 75 unit tests, no network
 
 python3 -m homeiot --demo &                            # end-to-end, needs Playwright
 node homeiot/tests/e2e.mjs
 ```
+
+None of the hardware for Sonos, Meross, Cast, Home Connect or the Internet-Box
+is here, so each of those protocols is stood up as a small HTTP server that
+answers the way the device does — the same SOAP envelopes, the same signed
+JSON — and the client is driven against it over a real socket. That catches
+what a mocked call would not: the headers, the encoding, the signature, and the
+parsing of a genuine reply.
 
 The end-to-end script drives a real browser with a **touchscreen and a tablet
 viewport**, taps rather than clicks, and asserts that each interaction actually
@@ -290,12 +358,22 @@ widths.
 
 ## Adding another integration
 
-`hue.py`, `shelly.py` and `demo.py` are interchangeable transports. Each
-exposes `snapshot(device)` and `send(device, rtype, rid, payload)`, and may
-expose `home(device, raw)` to normalise its own data into the shared shape
-(Hue's lives in `model.py`). `hub.transport()` picks between them by the
-`source` on the stored device.
+Every integration is a module registered in `integrations.py`, exposing:
 
-A fourth integration is one more module of that shape. Ids are
-`source:gateway:type:id`, so grouping, collections, pinned values, the UI and
-the event plumbing all come for free — Shelly took no changes to any of them.
+```python
+SOURCE                              # the namespace its ids live in
+probe(ip)                           # a device description, or None
+discover(deep)                      # what it can find on the network
+snapshot(device)                    # whatever the device will tell us
+home(device, raw)                   # normalised into the shared shape
+send(device, rtype, rid, payload)   # optional: omit it and it is read-only
+```
+
+Leaving out `send` is how an integration says it is read-only, and the
+dashboard takes it at its word: no switch is drawn, and a write is refused with
+a reason. A test asserts that what each module advertises in `ACCESS` matches
+what it actually implements, so the table above cannot drift from the truth.
+
+Ids are `source:gateway:type:id`, so grouping, collections, pinned values, the
+UI and the event plumbing come for free. Adding Sonos took no change to any of
+them.

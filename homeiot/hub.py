@@ -12,7 +12,7 @@ import threading
 import time
 from typing import Any, Callable
 
-from . import camera, demo, discovery, hue, model, shelly, store
+from . import camera, demo, discovery, hue, integrations, model, store
 
 POLL_STREAMING = 60.0  # the event stream carries changes; this is a safety net
 POLL_PLAIN = 4.0  # bridges without a stream (v1) and the simulator
@@ -40,7 +40,7 @@ def transport(bridge: dict[str, Any]):
     """Which integration speaks for this gateway or device."""
     if bridge.get("api") == "demo":
         return demo
-    return shelly if bridge.get("source") == shelly.SOURCE else hue
+    return integrations.module_for(bridge)
 
 
 def bridges(hub: dict[str, Any]) -> list[dict[str, Any]]:
@@ -81,6 +81,7 @@ def snapshot(hub: dict[str, Any]) -> dict[str, Any]:
             "readouts": resolve_readouts(config.get("readouts", []), home),
             "cameras": [camera.describe(item) for item in config.get("cameras", [])],
             "ffmpeg": camera.have_ffmpeg(),
+            "sources": integrations.sources(),
             "revision": hub["revision"],
             "generated_at": time.time(),
             "bridges": [
@@ -322,6 +323,9 @@ def command(hub: dict[str, Any], target_id: str, body: dict[str, Any]) -> dict[s
         if not bridge:
             failures.append(f"bridge {write['bridge']} is not connected")
             continue
+        if not integrations.can_write(bridge.get("source", "hue")):
+            failures.append(f"{bridge.get('name', 'that device')} can be read but not controlled")
+            continue
         resource = model.find_resource(raw.get(bridge["id"], {}), write["rtype"], write["rid"])
         payload = hue.build_payload(body, resource)
         if not payload:
@@ -416,13 +420,17 @@ def _schedule_refresh(hub: dict[str, Any], bridge: dict[str, Any], delay: float 
 # --- discovery ---------------------------------------------------------------
 
 
-def discover(hub: dict[str, Any], source: str = "hue", deep: bool = False) -> list[dict[str, Any]]:
+def discover(hub: dict[str, Any], source: str = "hue", deep: bool = False,
+             key: str = "") -> list[dict[str, Any]]:
+    """Ask one integration what it can see."""
     known = {bridge["id"] for bridge in bridges(hub)}
-    found = (
-        shelly.discover(deep=deep)
-        if source == shelly.SOURCE
-        else [{**item, "source": "hue"} for item in discovery.discover_hue(deep=deep)]
-    )
+    module = integrations.BY_SOURCE.get(source)
+    if module is None:
+        return []
+    if source == "meross":
+        found = module.discover(deep=True, key=key)  # no announcements, so always a sweep
+    else:
+        found = module.discover(deep=deep)
     return [{**item, "paired": item["id"] in known} for item in found]
 
 

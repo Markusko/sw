@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import camera, demo, hue, hub as hub_module, model, net, shelly, store
+from . import camera, demo, hue, hub as hub_module, integrations, model, net, shelly, store
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 CONTENT_TYPES = {
@@ -65,9 +65,50 @@ def post_refresh(hub: dict[str, Any], _match, _body, _query) -> Any:
     return {"ok": True, "revision": hub["revision"]}
 
 
+def get_sources(_hub: dict[str, Any], _match, _body, _query) -> Any:
+    return {"sources": integrations.sources()}
+
+
 def post_discover(hub: dict[str, Any], _match, body, _query) -> Any:
     source = str(body.get("source", "hue"))
-    return {"bridges": hub_module.discover(hub, source=source, deep=bool(body.get("deep")))}
+    found = hub_module.discover(
+        hub, source=source, deep=bool(body.get("deep")), key=str(body.get("key", ""))
+    )
+    return {"bridges": found}
+
+
+def post_adopt(hub: dict[str, Any], _match, body, _query) -> Any:
+    """Take on a device from any integration that does not need pairing."""
+    source = str(body.get("source", "")).strip()
+    ip = str(body.get("ip", "")).strip()
+    secret = str(body.get("key") or body.get("password") or "").strip()
+    module = integrations.BY_SOURCE.get(source)
+    if module is None or source == "hue":
+        raise ApiError("that is not something this can adopt directly")
+    if not ip:
+        raise ApiError("an address is required")
+
+    try:
+        found = module.probe(ip, key=secret) if source == "meross" else module.probe(ip)
+    except Exception as error:
+        raise ApiError(str(error), 502) from error
+    if not found:
+        raise ApiError(f"no {integrations.ACCESS[source]['label']} device answered at {ip}", 404)
+
+    if source == "meross":
+        if found.get("needs_key"):
+            raise ApiError("that device rejected the key — check it in your Meross account", 401)
+        device = module.make_device(found, key=secret)
+    elif source == "swisscom":
+        device = module.make_device(found, password=secret)
+    elif found.get("protected") and source == "shelly":
+        raise ApiError(f"{found['name']} has a password set, which is not supported yet", 501)
+    else:
+        device = module.make_device(found)
+
+    hub_module.add_bridge(hub, device)
+    return {"ok": True, "device": {"id": device["id"], "name": device["name"], "ip": device["ip"],
+                                   "source": source}}
 
 
 def post_shelly(hub: dict[str, Any], _match, body, _query) -> Any:
@@ -249,6 +290,8 @@ ROUTES: list[tuple[str, re.Pattern, Handler]] = [
     ("PUT", re.compile(r"^/api/ui$"), put_ui),
     ("POST", re.compile(r"^/api/scan$"), post_scan),
     ("POST", re.compile(r"^/api/shelly$"), post_shelly),
+    ("GET", re.compile(r"^/api/sources$"), get_sources),
+    ("POST", re.compile(r"^/api/adopt$"), post_adopt),
     ("POST", re.compile(r"^/api/readouts$"), post_readout),
     ("PUT", re.compile(r"^/api/readouts/(?P<id>[^/]+)$"), put_readout),
     ("DELETE", re.compile(r"^/api/readouts/(?P<id>[^/]+)$"), delete_readout),
@@ -477,6 +520,8 @@ def build_hub(demo_mode: bool = False) -> dict[str, Any]:
     if demo_mode and not any(bridge.get("demo") for bridge in config.get("bridges", [])):
         config = store.put_bridge(config, dict(demo.BRIDGE))
         config = store.put_bridge(config, dict(demo.SHELLY))
+        for fake in demo.FAKES:
+            config = store.put_bridge(config, dict(fake))
         config = store.put_camera(config, dict(demo.CAMERA))
         for readout in demo.READOUTS:
             config = store.put_readout(config, dict(readout))
@@ -516,6 +561,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--discover", action="store_true", help="print discovered bridges and exit")
     parser.add_argument("--scan", action="store_true", help="print every IoT host found on the LAN and exit")
+    parser.add_argument("--probe-box", metavar="ADDRESS", nargs="?", const="192.168.1.1",
+                        help="ask a Swisscom Internet-Box what its local API answers, and exit")
     arguments = parser.parse_args(argv)
 
     if arguments.discover:
@@ -530,6 +577,27 @@ def main(argv: list[str] | None = None) -> int:
         for host in discovery.scan_network():
             labels = ", ".join(host.get("labels", [])) or "unknown"
             print(f"{host['ip']:<16} {host.get('hostname', ''):<28} {labels}")
+        return 0
+
+    if arguments.probe_box:
+        from . import swisscom
+
+        print(f"asking {arguments.probe_box} what it answers:\n")
+        for result in swisscom.survey(arguments.probe_box):
+            head = f"  {result['probe']:<18} {result['path']:<28}"
+            if not result["answered"]:
+                print(f"{head} no answer")
+                continue
+            marks = []
+            if result.get("json"):
+                marks.append("JSON")
+            if result.get("looks_like_the_box"):
+                marks.append("names itself")
+            print(f"{head} HTTP {result['status']} {' '.join(marks)}")
+            sample = str(result.get("sample", "")).strip().replace("\n", " ")[:200]
+            if sample:
+                print(f"      {sample}")
+        print("\nSend this output along and the integration can be written against it.")
         return 0
 
     serve(arguments.host, arguments.port, arguments.demo, arguments.token, arguments.verbose)
